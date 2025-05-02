@@ -1,6 +1,7 @@
 from cassandra.cluster import Cluster
 from cassandra.auth import PlainTextAuthProvider
-from ssl import SSLContext, PROTOCOL_TLSv1_2
+from ssl import SSLContext, CERT_NONE, TLSVersion
+import ssl
 from cassandra import ConsistencyLevel
 from getpass import getpass
 
@@ -20,9 +21,10 @@ def connect_to_cassandra():
         print(f"Invalid partition size: {e}")
         return
     # Set up SSL context to ignore CA verification
-    ssl_context = SSLContext(PROTOCOL_TLSv1_2)
+    ssl_context = SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ssl_context.minimum_version = TLSVersion.TLSv1_2
     ssl_context.check_hostname = False
-    ssl_context.verify_mode = False  # Disable certificate verification
+    ssl_context.verify_mode = CERT_NONE
 
     # Set up authentication and cluster connection
     auth_provider = PlainTextAuthProvider(username, password)
