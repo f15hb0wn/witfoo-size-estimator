@@ -1,12 +1,14 @@
 from cassandra.cluster import Cluster
 from cassandra.auth import PlainTextAuthProvider
 from ssl import SSLContext, PROTOCOL_TLSv1_2
+from cassandra import ConsistencyLevel
+from getpass import getpass
 
 def connect_to_cassandra():
     # Prompt user for connection details
     cassandra_ip = input("Enter the Cassandra server IP address: ")
     username = input("Enter the Cassandra username: ")
-    password = input("Enter the Cassandra password: ")
+    password = getpass("Enter the Cassandra password: ")
     org_id = input("Enter the organization ID: ")
     partition_size = input("Enter the partition size in bytes: ")
     # Validate partition size
@@ -29,6 +31,7 @@ def connect_to_cassandra():
         auth_provider=auth_provider,
         ssl_context=ssl_context
     )
+    cluster.default_consistency_level = ConsistencyLevel.ONE
 
     try:
         session = cluster.connect()

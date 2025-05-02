@@ -1,7 +1,7 @@
 import time
 from cassandra.cluster import Cluster
 from cassandra.auth import PlainTextAuthProvider
-from cassandra import ReadTimeout # Import ReadTimeout
+from cassandra import ReadTimeout, ConsistencyLevel # Import ReadTimeout and ConsistencyLevel
 from ssl import SSLContext, CERT_NONE, TLSVersion
 import ssl
 import yaml
@@ -47,6 +47,7 @@ print("Connecting to IMPACT Cassandra server...")
 impact = impact_cluster.connect()
 # Set session-level timeout for queries
 impact.default_timeout = 600  # 10 minutes timeout for queries
+impact.default_consistency_level = ConsistencyLevel.ONE
 print("Connection to IMPACT Cassandra server successful")
 
 # Connect to AIO cluster
@@ -61,6 +62,7 @@ print("Connecting to AIO Cassandra server...")
 aio = aio_cluster.connect()
 # Set session-level timeout for queries
 aio.default_timeout = 600  # 10 minutes timeout for queries
+aio.default_consistency_level = ConsistencyLevel.ONE
 print("Connection to AIO Cassandra server successful")
 
 
