@@ -88,28 +88,32 @@ def copy_table(impact_session, aio_session, table_name, org_id, fetch_size=10, m
             print(f"\nAttempt {attempt + 1}/{max_retries + 1} to copy {full_table_name}...")
             source_row = 0
             
+            
             # 1. First query - only get lightweight fields (org_id, partition, created_at)
-            print(f"Querying lightweight fields to identify relevant rows. This will do a full table scan and may take a while...")
+            print(f"Querying lightweight fields to identify relevant rows. This will do a complete table scan and may take a while...")
             lightweight_query = f"SELECT org_id, partition, created_at FROM {full_table_name};"
             lightweight_statement = impact_session.prepare(lightweight_query)
             lightweight_statement.fetch_size = fetch_size
-            try:
-                lightweight_rows = impact_session.execute(lightweight_statement)
-            except Exception as e:
-                # Wait 5 seconds before retrying
-                print(f"Error during lightweight query execution: {e}. Retrying...")
-                time.sleep(retry_delay)
-                lightweight_rows = impact_session.execute(lightweight_statement)
-            
+            lightweight_rows = impact_session.execute(lightweight_statement)
+
             # Store the partition and created_at values that match our org_id
             matching_keys = []
-            for row in lightweight_rows:
-                source_row += 1
-                if source_row % 1000 == 0:
-                    print(f"Scanned {source_row} rows, found {len(matching_keys)} matching rows...")
-                
-                if hasattr(row, 'org_id') and row.org_id == org_id:
-                    matching_keys.append((row.partition, row.created_at))
+
+            # Initialize progress bar for scanning rows
+            with tqdm(total=fetch_size, desc="Scanning rows", unit="row") as scan_pbar:
+                for row in lightweight_rows:
+                    # For every 1000 source rows, wait for 1 second to cool down the server
+                    if source_row % 1000 == 0 and source_row > 0:
+                        time.sleep(1)
+                    source_row += 1
+                    scan_pbar.total = source_row  # Dynamically update total rows scanned
+                    scan_pbar.refresh()
+
+                    if hasattr(row, 'org_id') and row.org_id == org_id:
+                        matching_keys.append((row.partition, row.created_at))
+                        scan_pbar.set_postfix(found=len(matching_keys))
+
+                    scan_pbar.update(1)
 
             print(f"Found {len(matching_keys)} rows matching org_id {org_id}")
             
