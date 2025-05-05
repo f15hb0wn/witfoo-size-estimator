@@ -33,13 +33,13 @@ def connect_to_cassandra():
         auth_provider=auth_provider,
         ssl_context=ssl_context
     )
-    cluster.default_consistency_level = ConsistencyLevel.ONE
+    cluster.default_consistency_level = ConsistencyLevel.QUORUM
 
     try:
         session = cluster.connect()
         print("Connection to Cassandra server successful!")
 
-        query = "SELECT day, org_id FROM artifacts.full_artifact_partitions;"
+        query = "SELECT day, org_id FROM artifacts.artifact_partition_summary;"
         days = []
         oldest_day = None
         newest_day = None
@@ -47,6 +47,7 @@ def connect_to_cassandra():
 
         # Execute the query with pagination
         statement = session.prepare(query)
+        statement.consistency_level = ConsistencyLevel.QUORUM
         statement.fetch_size = 100  # Set fetch size to 100 rows
         rows = session.execute(statement)
 

@@ -95,6 +95,7 @@ def copy_table(impact_session, aio_session, table_name, org_id, fetch_size=10, m
             print(f"Querying lightweight fields to identify relevant rows. This will do a complete table scan and may take a while...")
             lightweight_query = f"SELECT org_id, partition, created_at FROM {full_table_name};"
             lightweight_statement = impact_session.prepare(lightweight_query)
+            lightweight_statement.consistency_level = ConsistencyLevel.QUORUM
             lightweight_statement.fetch_size = fetch_size
             lightweight_rows = impact_session.execute(lightweight_statement)
 
@@ -122,12 +123,15 @@ def copy_table(impact_session, aio_session, table_name, org_id, fetch_size=10, m
             # 2. Truncate Destination Table
             print(f"Truncating {full_table_name} in AIO...")
             truncate_query = f"TRUNCATE {full_table_name};"
-            aio_session.execute(truncate_query)
+            truncate_statement = aio_session.prepare(truncate_query)
+            truncate_statement.consistency_level = ConsistencyLevel.QUORUM
+            aio_session.execute(truncate_statement)
             print(f"Truncate complete.")
 
             # 3. Fetch and insert only the matching rows with all columns
             print(f"Fetching and copying full data for matching rows...")
             insert_statement = aio_session.prepare(insert_query_str)
+            insert_statement.consistency_level = ConsistencyLevel.QUORUM
             moved = 0
 
             # Initialize progress bar
@@ -137,6 +141,7 @@ def copy_table(impact_session, aio_session, table_name, org_id, fetch_size=10, m
                         # Query the specific row using partition, created_at, and org_id as filters
                         detailed_query = f"SELECT {', '.join(cols_to_copy)} FROM {full_table_name} WHERE partition = ? AND created_at = ? AND org_id = ?;"
                         detailed_statement = impact_session.prepare(detailed_query)
+                        detailed_statement.consistency_level = ConsistencyLevel.QUORUM
                         detailed_row = impact_session.execute(detailed_statement, [partition, created_at, org_id]).one()
 
                         if detailed_row:
