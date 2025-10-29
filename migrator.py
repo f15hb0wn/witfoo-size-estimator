@@ -66,6 +66,23 @@ aio.default_consistency_level = ConsistencyLevel.ONE
 print("Connection to AIO Cassandra server successful")
 
 
+# --- Helper Function ---
+def get_consistency_name(consistency_level):
+    """Get the name of a consistency level."""
+    consistency_names = {
+        ConsistencyLevel.ONE: "ONE",
+        ConsistencyLevel.QUORUM: "QUORUM",
+        ConsistencyLevel.ALL: "ALL",
+        ConsistencyLevel.LOCAL_QUORUM: "LOCAL_QUORUM",
+        ConsistencyLevel.EACH_QUORUM: "EACH_QUORUM",
+        ConsistencyLevel.LOCAL_ONE: "LOCAL_ONE",
+        ConsistencyLevel.ANY: "ANY",
+        ConsistencyLevel.TWO: "TWO",
+        ConsistencyLevel.THREE: "THREE",
+    }
+    return consistency_names.get(consistency_level, str(consistency_level))
+
+
 # --- Table Copy Function with Retry Logic ---
 def copy_table(impact_session, aio_session, table_name, org_id, fetch_size=10, max_retries=3, retry_delay=5):
     """Copies data for a specific table from IMPACT to AIO with retry logic."""
@@ -92,7 +109,7 @@ def copy_table(impact_session, aio_session, table_name, org_id, fetch_size=10, m
             consistency_level = ConsistencyLevel.QUORUM
             
             # 1. First query - only get lightweight fields (org_id, partition, created_at)
-            print(f"Querying lightweight fields to identify relevant rows with consistency {consistency_level.name}. This will do a complete table scan and may take a while...")
+            print(f"Querying lightweight fields to identify relevant rows with consistency {get_consistency_name(consistency_level)}. This will do a complete table scan and may take a while...")
             lightweight_query = f"SELECT org_id, partition, created_at FROM {full_table_name};"
             lightweight_statement = impact_session.prepare(lightweight_query)
             lightweight_statement.consistency_level = consistency_level
@@ -129,7 +146,7 @@ def copy_table(impact_session, aio_session, table_name, org_id, fetch_size=10, m
             print(f"Found {len(matching_keys)} rows matching org_id {org_id}")
             
             # 2. Truncate Destination Table
-            print(f"Truncating {full_table_name} in AIO with consistency {consistency_level.name}...")
+            print(f"Truncating {full_table_name} in AIO with consistency {get_consistency_name(consistency_level)}...")
             truncate_query = f"TRUNCATE {full_table_name};"
             truncate_statement = aio_session.prepare(truncate_query)
             truncate_statement.consistency_level = consistency_level
@@ -146,7 +163,7 @@ def copy_table(impact_session, aio_session, table_name, org_id, fetch_size=10, m
                 print(f"Truncate complete.")
 
             # 3. Fetch and insert only the matching rows with all columns
-            print(f"Fetching and copying full data for matching rows with consistency {consistency_level.name}...")
+            print(f"Fetching and copying full data for matching rows with consistency {get_consistency_name(consistency_level)}...")
             insert_statement = aio_session.prepare(insert_query_str)
             insert_statement.consistency_level = consistency_level
             moved = 0
@@ -164,7 +181,7 @@ def copy_table(impact_session, aio_session, table_name, org_id, fetch_size=10, m
                             detailed_row = impact_session.execute(detailed_statement, [partition, created_at, org_id]).one()
                         except (Unavailable, ReadTimeout, WriteTimeout) as consistency_error:
                             # Retry individual row query with consistency ONE
-                            print(f"\nConsistency {consistency_level.name} failed for row query: {consistency_error}")
+                            print(f"\nConsistency {get_consistency_name(consistency_level)} failed for row query: {consistency_error}")
                             print(f"Retrying with consistency ONE...")
                             detailed_statement.consistency_level = ConsistencyLevel.ONE
                             detailed_row = impact_session.execute(detailed_statement, [partition, created_at, org_id]).one()
@@ -177,7 +194,7 @@ def copy_table(impact_session, aio_session, table_name, org_id, fetch_size=10, m
                                 aio_session.execute(insert_statement, values)
                             except (Unavailable, ReadTimeout, WriteTimeout) as consistency_error:
                                 # Retry insert with consistency ONE
-                                print(f"\nConsistency {consistency_level.name} failed for insert: {consistency_error}")
+                                print(f"\nConsistency {get_consistency_name(consistency_level)} failed for insert: {consistency_error}")
                                 print(f"Retrying insert with consistency ONE...")
                                 insert_statement.consistency_level = ConsistencyLevel.ONE
                                 aio_session.execute(insert_statement, values)
