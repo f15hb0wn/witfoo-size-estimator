@@ -1,7 +1,7 @@
 import time
 from cassandra.cluster import Cluster
 from cassandra.auth import PlainTextAuthProvider
-from cassandra import ReadTimeout, ConsistencyLevel # Import ReadTimeout and ConsistencyLevel
+from cassandra import ReadTimeout, ConsistencyLevel, Unavailable, WriteTimeout # Import ReadTimeout and ConsistencyLevel
 from ssl import SSLContext, CERT_NONE, TLSVersion
 import ssl
 import yaml
@@ -89,15 +89,23 @@ def copy_table(impact_session, aio_session, table_name, org_id, fetch_size=10, m
         try:
             print(f"\nAttempt {attempt + 1}/{max_retries + 1} to copy {full_table_name}...")
             source_row = 0
-            
+            consistency_level = ConsistencyLevel.QUORUM
             
             # 1. First query - only get lightweight fields (org_id, partition, created_at)
-            print(f"Querying lightweight fields to identify relevant rows. This will do a complete table scan and may take a while...")
+            print(f"Querying lightweight fields to identify relevant rows with consistency {consistency_level.name}. This will do a complete table scan and may take a while...")
             lightweight_query = f"SELECT org_id, partition, created_at FROM {full_table_name};"
             lightweight_statement = impact_session.prepare(lightweight_query)
-            lightweight_statement.consistency_level = ConsistencyLevel.QUORUM
+            lightweight_statement.consistency_level = consistency_level
             lightweight_statement.fetch_size = fetch_size
-            lightweight_rows = impact_session.execute(lightweight_statement)
+            
+            try:
+                lightweight_rows = impact_session.execute(lightweight_statement)
+            except (Unavailable, ReadTimeout, WriteTimeout) as consistency_error:
+                print(f"Consistency QUORUM failed: {consistency_error}")
+                print(f"Retrying with consistency ONE...")
+                consistency_level = ConsistencyLevel.ONE
+                lightweight_statement.consistency_level = consistency_level
+                lightweight_rows = impact_session.execute(lightweight_statement)
 
             # Store the partition and created_at values that match our org_id
             matching_keys = []
@@ -121,17 +129,26 @@ def copy_table(impact_session, aio_session, table_name, org_id, fetch_size=10, m
             print(f"Found {len(matching_keys)} rows matching org_id {org_id}")
             
             # 2. Truncate Destination Table
-            print(f"Truncating {full_table_name} in AIO...")
+            print(f"Truncating {full_table_name} in AIO with consistency {consistency_level.name}...")
             truncate_query = f"TRUNCATE {full_table_name};"
             truncate_statement = aio_session.prepare(truncate_query)
-            truncate_statement.consistency_level = ConsistencyLevel.QUORUM
-            aio_session.execute(truncate_statement)
-            print(f"Truncate complete.")
+            truncate_statement.consistency_level = consistency_level
+            
+            try:
+                aio_session.execute(truncate_statement)
+                print(f"Truncate complete.")
+            except (Unavailable, ReadTimeout, WriteTimeout) as consistency_error:
+                print(f"Consistency QUORUM failed for truncate: {consistency_error}")
+                print(f"Retrying truncate with consistency ONE...")
+                consistency_level = ConsistencyLevel.ONE
+                truncate_statement.consistency_level = consistency_level
+                aio_session.execute(truncate_statement)
+                print(f"Truncate complete.")
 
             # 3. Fetch and insert only the matching rows with all columns
-            print(f"Fetching and copying full data for matching rows...")
+            print(f"Fetching and copying full data for matching rows with consistency {consistency_level.name}...")
             insert_statement = aio_session.prepare(insert_query_str)
-            insert_statement.consistency_level = ConsistencyLevel.QUORUM
+            insert_statement.consistency_level = consistency_level
             moved = 0
 
             # Initialize progress bar
@@ -141,13 +158,30 @@ def copy_table(impact_session, aio_session, table_name, org_id, fetch_size=10, m
                         # Query the specific row using partition, created_at, and org_id as filters
                         detailed_query = f"SELECT {', '.join(cols_to_copy)} FROM {full_table_name} WHERE partition = ? AND created_at = ? AND org_id = ?;"
                         detailed_statement = impact_session.prepare(detailed_query)
-                        detailed_statement.consistency_level = ConsistencyLevel.QUORUM
-                        detailed_row = impact_session.execute(detailed_statement, [partition, created_at, org_id]).one()
+                        detailed_statement.consistency_level = consistency_level
+                        
+                        try:
+                            detailed_row = impact_session.execute(detailed_statement, [partition, created_at, org_id]).one()
+                        except (Unavailable, ReadTimeout, WriteTimeout) as consistency_error:
+                            # Retry individual row query with consistency ONE
+                            print(f"\nConsistency {consistency_level.name} failed for row query: {consistency_error}")
+                            print(f"Retrying with consistency ONE...")
+                            detailed_statement.consistency_level = ConsistencyLevel.ONE
+                            detailed_row = impact_session.execute(detailed_statement, [partition, created_at, org_id]).one()
 
                         if detailed_row:
                             # Extract data using the defined column names
                             values = tuple(getattr(detailed_row, col) for col in cols_to_copy)
-                            aio_session.execute(insert_statement, values)
+                            
+                            try:
+                                aio_session.execute(insert_statement, values)
+                            except (Unavailable, ReadTimeout, WriteTimeout) as consistency_error:
+                                # Retry insert with consistency ONE
+                                print(f"\nConsistency {consistency_level.name} failed for insert: {consistency_error}")
+                                print(f"Retrying insert with consistency ONE...")
+                                insert_statement.consistency_level = ConsistencyLevel.ONE
+                                aio_session.execute(insert_statement, values)
+                            
                             moved += 1
 
                         # Update progress bar
