@@ -243,12 +243,12 @@ def copy_table(impact_session, aio_session, table_name, org_id, fetch_size=10, m
 # --- Main Execution Logic ---
 # Define tables to copy and their fetch sizes
 tables_to_copy = {
-    "objects": 10,
+    "objects": 1,
     "reports": 1,
-    "incident_to_partition": 10,
-    "partition_index": 10,
-    "incident_summary": 10,
-    "incidents": 11
+    "incident_to_partition": 1,
+    "partition_index": 1,
+    "incident_summary": 1,
+    "incidents": 1
 }
 
 # Call the function for each table
