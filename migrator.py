@@ -167,49 +167,59 @@ def copy_table(impact_session, aio_session, table_name, org_id, fetch_size=10, m
             insert_statement = aio_session.prepare(insert_query_str)
             insert_statement.consistency_level = consistency_level
             moved = 0
+            batch_size = 10  # Fetch 10 rows at a time to avoid timeouts
 
             # Initialize progress bar
             with tqdm(total=len(matching_keys), desc="Copying rows", unit="row") as pbar:
-                for partition, created_at in matching_keys:
-                    try:
-                        # Query the specific row using partition, created_at, and org_id as filters
-                        detailed_query = f"SELECT {', '.join(cols_to_copy)} FROM {full_table_name} WHERE partition = ? AND created_at = ? AND org_id = ?;"
-                        detailed_statement = impact_session.prepare(detailed_query)
-                        detailed_statement.consistency_level = consistency_level
-                        
+                # Process matching keys in batches
+                for batch_start in range(0, len(matching_keys), batch_size):
+                    batch_end = min(batch_start + batch_size, len(matching_keys))
+                    batch_keys = matching_keys[batch_start:batch_end]
+                    
+                    for partition, created_at in batch_keys:
                         try:
-                            detailed_row = impact_session.execute(detailed_statement, [partition, created_at, org_id]).one()
-                        except (Unavailable, ReadTimeout, WriteTimeout) as consistency_error:
-                            # Retry individual row query with consistency ONE
-                            print(f"\nConsistency {get_consistency_name(consistency_level)} failed for row query: {consistency_error}")
-                            print(f"Retrying with consistency ONE...")
-                            detailed_statement.consistency_level = ConsistencyLevel.ONE
-                            detailed_row = impact_session.execute(detailed_statement, [partition, created_at, org_id]).one()
-
-                        if detailed_row:
-                            # Extract data using the defined column names
-                            values = tuple(getattr(detailed_row, col) for col in cols_to_copy)
+                            # Query the specific row using partition, created_at, and org_id as filters
+                            detailed_query = f"SELECT {', '.join(cols_to_copy)} FROM {full_table_name} WHERE partition = ? AND created_at = ? AND org_id = ?;"
+                            detailed_statement = impact_session.prepare(detailed_query)
+                            detailed_statement.consistency_level = consistency_level
                             
                             try:
-                                aio_session.execute(insert_statement, values)
+                                detailed_row = impact_session.execute(detailed_statement, [partition, created_at, org_id]).one()
                             except (Unavailable, ReadTimeout, WriteTimeout) as consistency_error:
-                                # Retry insert with consistency ONE
-                                print(f"\nConsistency {get_consistency_name(consistency_level)} failed for insert: {consistency_error}")
-                                print(f"Retrying insert with consistency ONE...")
-                                insert_statement.consistency_level = ConsistencyLevel.ONE
-                                aio_session.execute(insert_statement, values)
-                            
-                            moved += 1
+                                # Retry individual row query with consistency ONE
+                                print(f"\nConsistency {get_consistency_name(consistency_level)} failed for row query: {consistency_error}")
+                                print(f"Retrying with consistency ONE...")
+                                detailed_statement.consistency_level = ConsistencyLevel.ONE
+                                detailed_row = impact_session.execute(detailed_statement, [partition, created_at, org_id]).one()
 
-                        # Update progress bar
-                        pbar.update(1)
+                            if detailed_row:
+                                # Extract data using the defined column names
+                                values = tuple(getattr(detailed_row, col) for col in cols_to_copy)
+                                
+                                try:
+                                    aio_session.execute(insert_statement, values)
+                                except (Unavailable, ReadTimeout, WriteTimeout) as consistency_error:
+                                    # Retry insert with consistency ONE
+                                    print(f"\nConsistency {get_consistency_name(consistency_level)} failed for insert: {consistency_error}")
+                                    print(f"Retrying insert with consistency ONE...")
+                                    insert_statement.consistency_level = ConsistencyLevel.ONE
+                                    aio_session.execute(insert_statement, values)
+                                
+                                moved += 1
 
-                    except AttributeError as ae:
-                        print(f"Warning: Skipping row due to missing attribute: {ae}. Partition: {partition}, created_at: {created_at}")
-                        pbar.update(1)
-                    except Exception as insert_err:
-                        print(f"Warning: Skipping row due to insert error: {insert_err}. Partition: {partition}, created_at: {created_at}")
-                        pbar.update(1)
+                            # Update progress bar
+                            pbar.update(1)
+
+                        except AttributeError as ae:
+                            print(f"Warning: Skipping row due to missing attribute: {ae}. Partition: {partition}, created_at: {created_at}")
+                            pbar.update(1)
+                        except Exception as insert_err:
+                            print(f"Warning: Skipping row due to insert error: {insert_err}. Partition: {partition}, created_at: {created_at}")
+                            pbar.update(1)
+                    
+                    # Small delay between batches to avoid overwhelming the server
+                    if batch_end < len(matching_keys):
+                        time.sleep(0.1)
 
             print(f"Successfully copied {moved} rows from {full_table_name} to AIO.")
             return # Exit function on success
