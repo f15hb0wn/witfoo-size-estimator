@@ -3,6 +3,7 @@ from cassandra.cluster import Cluster, NoHostAvailable
 from cassandra.auth import PlainTextAuthProvider
 from cassandra import ReadTimeout, ConsistencyLevel, Unavailable, WriteTimeout
 from cassandra.query import BatchStatement, SimpleStatement
+from cassandra.policies import WhiteListRoundRobinPolicy
 from ssl import SSLContext, CERT_NONE, TLSVersion
 import ssl
 import yaml
@@ -55,7 +56,7 @@ impact_cluster = Cluster(
     auth_provider=impact_auth_provider,
     ssl_context=ssl_context,
     protocol_version=4,
-    load_balancing_policy=None,  # Disable load balancing
+    load_balancing_policy=WhiteListRoundRobinPolicy([IMPACT_CLUSTER_SEED_NODES]),  # Restrict to only this host
     **timeout_config
 )
 logging.info("Connecting to IMPACT Cassandra server (single node only)...")
@@ -71,7 +72,7 @@ aio_cluster = Cluster(
     auth_provider=aio_auth_provider,
     ssl_context=ssl_context,
     protocol_version=4,
-    load_balancing_policy=None,  # Disable load balancing
+    load_balancing_policy=WhiteListRoundRobinPolicy([AIO_IP]),  # Restrict to only this host
     **timeout_config
 )
 logging.info("Connecting to AIO Cassandra server (single node only)...")
