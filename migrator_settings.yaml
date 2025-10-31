@@ -10,3 +10,6 @@ AIO_PASSWORD: F00theN0ise!
 MAX_WORKERS: 5              # Number of parallel threads for fetching data (1-10 recommended)
 BATCH_INSERT_SIZE: 25       # Default batch size (will be overridden for specific tables like reports)
 FETCH_BATCH_SIZE: 100       # Number of rows to process before taking a small break (50-500 recommended)
+
+# Migration behavior
+TRUNCATE_BEFORE_COPY: true  # If true, truncate destination tables before copying (faster, but destructive)

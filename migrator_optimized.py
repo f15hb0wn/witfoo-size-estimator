@@ -38,6 +38,9 @@ MAX_WORKERS = config.get('MAX_WORKERS', 10)  # Increased for smaller tables
 BATCH_INSERT_SIZE = config.get('BATCH_INSERT_SIZE', 25)  # Reduced for large objects
 FETCH_BATCH_SIZE = config.get('FETCH_BATCH_SIZE', 200)  # Increased chunk size
 
+# Migration behavior
+TRUNCATE_BEFORE_COPY = config.get('TRUNCATE_BEFORE_COPY', False)  # Truncate tables before copying
+
 # Table-specific batch sizes (for tables with large blob data)
 TABLE_BATCH_SIZES = {
     'reports': 10,  # Reports have large object blobs
@@ -130,6 +133,23 @@ SOURCE_HAS_ORG_ID = SOURCE_SCHEMAS.get('objects', True)
 DEST_HAS_ORG_ID = DEST_SCHEMAS.get('objects', True)
 
 # --- Helper Functions ---
+def truncate_table(session, table_name):
+    """
+    Truncate a table in the destination cluster.
+    WARNING: This permanently deletes all data in the table!
+    """
+    keyspace = "precinct"
+    full_table_name = f"{keyspace}.{table_name}"
+    try:
+        logging.info(f"  TRUNCATING {full_table_name}...")
+        session.execute(f"TRUNCATE {full_table_name};")
+        logging.info(f"  ✓ Successfully truncated {full_table_name}")
+        return True
+    except Exception as e:
+        logging.error(f"  ✗ Failed to truncate {full_table_name}: {e}")
+        return False
+
+
 def get_consistency_name(consistency_level):
     """Get the name of a consistency level."""
     consistency_names = {
@@ -208,22 +228,24 @@ def copy_objects_partition(impact_session, aio_session, partition_name, org_id, 
         logging.info(f"  Found {len(rows_list)} rows for partition '{partition_name}'")
         
         # Delete existing data for this partition in AIO - adapt based on destination schema
-        if DEST_HAS_ORG_ID:
-            delete_query = f"DELETE FROM {full_table_name} WHERE partition = ? AND org_id = ?;"
-            delete_stmt = aio_session.prepare(delete_query)
-            delete_stmt.consistency_level = consistency_level
-            try:
-                execute_with_retry(aio_session, delete_stmt, [partition_name, org_id])
-            except Exception as e:
-                logging.warning(f"  Could not delete existing data (may not exist): {e}")
-        else:
-            delete_query = f"DELETE FROM {full_table_name} WHERE partition = ?;"
-            delete_stmt = aio_session.prepare(delete_query)
-            delete_stmt.consistency_level = consistency_level
-            try:
-                execute_with_retry(aio_session, delete_stmt, [partition_name])
-            except Exception as e:
-                logging.warning(f"  Could not delete existing data (may not exist): {e}")
+        # Skip if we already truncated the table
+        if not TRUNCATE_BEFORE_COPY:
+            if DEST_HAS_ORG_ID:
+                delete_query = f"DELETE FROM {full_table_name} WHERE partition = ? AND org_id = ?;"
+                delete_stmt = aio_session.prepare(delete_query)
+                delete_stmt.consistency_level = consistency_level
+                try:
+                    execute_with_retry(aio_session, delete_stmt, [partition_name, org_id])
+                except Exception as e:
+                    logging.warning(f"  Could not delete existing data (may not exist): {e}")
+            else:
+                delete_query = f"DELETE FROM {full_table_name} WHERE partition = ?;"
+                delete_stmt = aio_session.prepare(delete_query)
+                delete_stmt.consistency_level = consistency_level
+                try:
+                    execute_with_retry(aio_session, delete_stmt, [partition_name])
+                except Exception as e:
+                    logging.warning(f"  Could not delete existing data (may not exist): {e}")
         
         # Insert data - adapt based on destination schema
         if DEST_HAS_ORG_ID:
@@ -343,37 +365,41 @@ def copy_table_with_org_filter(impact_session, aio_session, table_name, org_id, 
                 return
             
             # 2. Delete existing data in AIO - adapt based on destination schema
-            logging.info(f"Deleting existing data from AIO...")
-            if dest_has_org_id:
-                delete_query = f"DELETE FROM {full_table_name} WHERE partition = ? AND created_at = ? AND org_id = ?;"
-                delete_stmt = aio_session.prepare(delete_query)
-                delete_stmt.consistency_level = consistency_level
-                
-                # Delete in batches
-                for i in tqdm(range(0, len(matching_keys), batch_size), desc="Deleting old data", unit="batch"):
-                    batch_keys = matching_keys[i:i + batch_size]
-                    batch = BatchStatement(consistency_level=consistency_level)
-                    for partition, created_at in batch_keys:
-                        batch.add(delete_stmt, [partition, created_at, org_id])
-                    try:
-                        execute_with_retry(aio_session, batch)
-                    except Exception as e:
-                        logging.warning(f"Batch delete failed: {e}")
+            # Skip if we already truncated the table
+            if not TRUNCATE_BEFORE_COPY:
+                logging.info(f"Deleting existing data from AIO...")
+                if dest_has_org_id:
+                    delete_query = f"DELETE FROM {full_table_name} WHERE partition = ? AND created_at = ? AND org_id = ?;"
+                    delete_stmt = aio_session.prepare(delete_query)
+                    delete_stmt.consistency_level = consistency_level
+                    
+                    # Delete in batches
+                    for i in tqdm(range(0, len(matching_keys), batch_size), desc="Deleting old data", unit="batch"):
+                        batch_keys = matching_keys[i:i + batch_size]
+                        batch = BatchStatement(consistency_level=consistency_level)
+                        for partition, created_at in batch_keys:
+                            batch.add(delete_stmt, [partition, created_at, org_id])
+                        try:
+                            execute_with_retry(aio_session, batch)
+                        except Exception as e:
+                            logging.warning(f"Batch delete failed: {e}")
+                else:
+                    delete_query = f"DELETE FROM {full_table_name} WHERE partition = ? AND created_at = ?;"
+                    delete_stmt = aio_session.prepare(delete_query)
+                    delete_stmt.consistency_level = consistency_level
+                    
+                    # Delete in batches
+                    for i in tqdm(range(0, len(matching_keys), batch_size), desc="Deleting old data", unit="batch"):
+                        batch_keys = matching_keys[i:i + batch_size]
+                        batch = BatchStatement(consistency_level=consistency_level)
+                        for partition, created_at in batch_keys:
+                            batch.add(delete_stmt, [partition, created_at])
+                        try:
+                            execute_with_retry(aio_session, batch)
+                        except Exception as e:
+                            logging.warning(f"Batch delete failed: {e}")
             else:
-                delete_query = f"DELETE FROM {full_table_name} WHERE partition = ? AND created_at = ?;"
-                delete_stmt = aio_session.prepare(delete_query)
-                delete_stmt.consistency_level = consistency_level
-                
-                # Delete in batches
-                for i in tqdm(range(0, len(matching_keys), batch_size), desc="Deleting old data", unit="batch"):
-                    batch_keys = matching_keys[i:i + batch_size]
-                    batch = BatchStatement(consistency_level=consistency_level)
-                    for partition, created_at in batch_keys:
-                        batch.add(delete_stmt, [partition, created_at])
-                    try:
-                        execute_with_retry(aio_session, batch)
-                    except Exception as e:
-                        logging.warning(f"Batch delete failed: {e}")
+                logging.info(f"Skipping deletion (table was truncated)")
             
             # 3. Fetch and insert data with parallel processing
             logging.info(f"Copying data with {MAX_WORKERS} parallel workers...")
@@ -528,6 +554,19 @@ def copy_table_with_org_filter(impact_session, aio_session, table_name, org_id, 
 logging.info("="*80)
 logging.info("Starting Optimized Migration Process")
 logging.info("="*80)
+
+# Truncate tables if requested
+if TRUNCATE_BEFORE_COPY:
+    logging.info("\n" + "="*80)
+    logging.info("TRUNCATING DESTINATION TABLES (as requested in config)")
+    logging.info("="*80)
+    logging.warning("⚠️  WARNING: This will permanently delete all data in destination tables!")
+    
+    tables_to_truncate = ['objects', 'reports', 'incidents', 'incident_summary', 'partition_index', 'incident_to_partition']
+    for table in tables_to_truncate:
+        truncate_table(aio, table)
+    
+    logging.info("Truncation complete.\n")
 
 migration_stats = {}
 consistency_level = ConsistencyLevel.ONE
