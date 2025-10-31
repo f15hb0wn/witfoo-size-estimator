@@ -413,8 +413,8 @@ def copy_table_with_org_filter(impact_session, aio_session, table_name, org_id, 
             else:
                 logging.info(f"Skipping deletion (table was truncated)")
             
-            # 3. Fetch and insert data with parallel processing
-            logging.info(f"Copying data with {MAX_WORKERS} parallel workers...")
+            # 3. Fetch and insert data with parallel processing (individual inserts, no batching)
+            logging.info(f"Copying data with {MAX_WORKERS} parallel workers (individual inserts)...")
             
             # Build detail query based on source schema
             if source_has_org_id:
@@ -430,7 +430,6 @@ def copy_table_with_org_filter(impact_session, aio_session, table_name, org_id, 
             
             moved = 0
             failed = 0
-            batch_data = []
             
             def fetch_row(partition, created_at):
                 try:
@@ -477,31 +476,13 @@ def copy_table_with_org_filter(impact_session, aio_session, table_name, org_id, 
                                         # Schemas match, use as-is
                                         insert_data = row_data
                                     
-                                    batch_data.append(insert_data)
-                                    
-                                    if len(batch_data) >= batch_size:
-                                        batch = BatchStatement(consistency_level=consistency_level)
-                                        for values in batch_data:
-                                            batch.add(insert_statement, values)
-                                        try:
-                                            execute_with_retry(aio_session, batch)
-                                            moved += len(batch_data)
-                                        except Exception as e:
-                                            error_msg = str(e)
-                                            if "Batch too large" in error_msg:
-                                                # Insert rows individually instead of batching
-                                                logging.warning(f"Batch too large ({len(batch_data)} rows), inserting individually...")
-                                                for values in batch_data:
-                                                    try:
-                                                        execute_with_retry(aio_session, insert_statement, values)
-                                                        moved += 1
-                                                    except Exception as e2:
-                                                        logging.error(f"Individual insert failed: {e2}")
-                                                        failed += 1
-                                            else:
-                                                logging.warning(f"Batch insert failed: {e}")
-                                                failed += len(batch_data)
-                                        batch_data = []
+                                    # Insert row individually (no batching)
+                                    try:
+                                        execute_with_retry(aio_session, insert_statement, insert_data)
+                                        moved += 1
+                                    except Exception as e:
+                                        logging.error(f"Insert failed: {e}")
+                                        failed += 1
                                 else:
                                     failed += 1
                             except Exception as e:
@@ -509,30 +490,6 @@ def copy_table_with_org_filter(impact_session, aio_session, table_name, org_id, 
                                 failed += 1
                             finally:
                                 pbar.update(1)
-                
-                # Insert remaining batch
-                if batch_data:
-                    batch = BatchStatement(consistency_level=consistency_level)
-                    for values in batch_data:
-                        batch.add(insert_statement, values)
-                    try:
-                        execute_with_retry(aio_session, batch)
-                        moved += len(batch_data)
-                    except Exception as e:
-                        error_msg = str(e)
-                        if "Batch too large" in error_msg:
-                            # Insert rows individually instead of batching
-                            logging.warning(f"Final batch too large ({len(batch_data)} rows), inserting individually...")
-                            for values in batch_data:
-                                try:
-                                    execute_with_retry(aio_session, insert_statement, values)
-                                    moved += 1
-                                except Exception as e2:
-                                    logging.error(f"Individual insert failed: {e2}")
-                                    failed += 1
-                        else:
-                            logging.warning(f"Final batch insert failed: {e}")
-                            failed += len(batch_data)
             
             logging.info(f"Successfully copied {moved} rows from {full_table_name}")
             if failed > 0:
