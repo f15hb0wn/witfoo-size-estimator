@@ -1,12 +1,25 @@
 import time
 from cassandra.cluster import Cluster
 from cassandra.auth import PlainTextAuthProvider
-from cassandra import ReadTimeout, ConsistencyLevel, Unavailable, WriteTimeout # Import ReadTimeout and ConsistencyLevel
+from cassandra import ReadTimeout, ConsistencyLevel, Unavailable, WriteTimeout, NoHostAvailable
+from cassandra.query import BatchStatement, SimpleStatement
 from ssl import SSLContext, CERT_NONE, TLSVersion
 import ssl
 import yaml
 from cassandra.policies import RetryPolicy
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('migrator.log'),
+        logging.StreamHandler()
+    ]
+)
 
 # --- Configuration Loading ---
 # Load configuration from YAML file
@@ -21,6 +34,11 @@ IMPACT_ORG_ID = config['IMPACT_ORG_ID']
 AIO_IP = config['AIO_IP']
 AIO_USERNAME = config['AIO_USERNAME']
 AIO_PASSWORD = config['AIO_PASSWORD']
+
+# Performance tuning parameters
+MAX_WORKERS = config.get('MAX_WORKERS', 5)  # Number of parallel threads
+BATCH_INSERT_SIZE = config.get('BATCH_INSERT_SIZE', 50)  # Cassandra batch size
+FETCH_BATCH_SIZE = config.get('FETCH_BATCH_SIZE', 100)  # How many rows to process before small delay
 
 # --- Cassandra Connections ---
 # Setup SSL context with proper protocol argument (fixing deprecation warning)
@@ -41,14 +59,15 @@ impact_cluster = Cluster(
     [IMPACT_CLUSTER_SEED_NODES],
     auth_provider=impact_auth_provider,
     ssl_context=ssl_context,
+    protocol_version=4,  # Explicitly set protocol version
     **timeout_config  # Apply timeout configuration
 )
-print("Connecting to IMPACT Cassandra server...")
+logging.info("Connecting to IMPACT Cassandra server...")
 impact = impact_cluster.connect()
 # Set session-level timeout for queries
 impact.default_timeout = 600  # 10 minutes timeout for queries
 impact.default_consistency_level = ConsistencyLevel.ONE
-print("Connection to IMPACT Cassandra server successful")
+logging.info("Connection to IMPACT Cassandra server successful")
 
 # Connect to AIO cluster
 aio_auth_provider = PlainTextAuthProvider(AIO_USERNAME, AIO_PASSWORD)
@@ -56,17 +75,17 @@ aio_cluster = Cluster(
     [AIO_IP],
     auth_provider=aio_auth_provider,
     ssl_context=ssl_context,
+    protocol_version=4,  # Explicitly set protocol version
     **timeout_config  # Apply same timeout configuration
 )
-print("Connecting to AIO Cassandra server...")
+logging.info("Connecting to AIO Cassandra server...")
 aio = aio_cluster.connect()
 # Set session-level timeout for queries
 aio.default_timeout = 600  # 10 minutes timeout for queries
 aio.default_consistency_level = ConsistencyLevel.ONE
-print("Connection to AIO Cassandra server successful")
+logging.info("Connection to AIO Cassandra server successful")
 
-
-# --- Helper Function ---
+# --- Helper Functions ---
 def get_consistency_name(consistency_level):
     """Get the name of a consistency level."""
     consistency_names = {
@@ -83,58 +102,125 @@ def get_consistency_name(consistency_level):
     return consistency_names.get(consistency_level, str(consistency_level))
 
 
-# --- Table Copy Function with Retry Logic ---
-def copy_table(impact_session, aio_session, table_name, org_id, fetch_size=10, max_retries=3, retry_delay=5):
-    """Copies data for a specific table from IMPACT to AIO with retry logic."""
+def execute_with_retry(session, statement, params=None, max_retries=2):
+    """Execute a statement with automatic retry on consistency failures."""
+    original_consistency = statement.consistency_level
+    
+    for retry in range(max_retries + 1):
+        try:
+            if params:
+                return session.execute(statement, params)
+            else:
+                return session.execute(statement)
+        except (Unavailable, ReadTimeout, WriteTimeout) as e:
+            if retry < max_retries:
+                # Try with lower consistency level
+                if statement.consistency_level == ConsistencyLevel.QUORUM:
+                    logging.warning(f"Consistency QUORUM failed: {e}. Retrying with ONE...")
+                    statement.consistency_level = ConsistencyLevel.ONE
+                elif retry == max_retries - 1:
+                    logging.error(f"Final retry failed: {e}")
+                    raise
+            else:
+                raise
+        except NoHostAvailable as e:
+            logging.error(f"No hosts available: {e}")
+            if retry < max_retries:
+                time.sleep(2 ** retry)  # Exponential backoff
+            else:
+                raise
+    
+    # Reset to original consistency level
+    statement.consistency_level = original_consistency
+
+
+def fetch_row_data(impact_session, full_table_name, cols_to_copy, partition, created_at, org_id, consistency_level):
+    """Fetch a single row's data with error handling."""
+    try:
+        detailed_query = f"SELECT {', '.join(cols_to_copy)} FROM {full_table_name} WHERE partition = ? AND created_at = ? AND org_id = ?;"
+        detailed_statement = impact_session.prepare(detailed_query)
+        detailed_statement.consistency_level = consistency_level
+        
+        result = execute_with_retry(impact_session, detailed_statement, [partition, created_at, org_id])
+        row = result.one()
+        
+        if row:
+            return tuple(getattr(row, col) for col in cols_to_copy)
+        return None
+    except Exception as e:
+        logging.warning(f"Failed to fetch row (partition={partition}, created_at={created_at}): {e}")
+        return None
+
+
+def insert_batch(aio_session, insert_statement, batch_data):
+    """Insert a batch of data with retry logic."""
+    if not batch_data:
+        return 0
+    
+    try:
+        batch = BatchStatement(consistency_level=insert_statement.consistency_level)
+        for values in batch_data:
+            batch.add(insert_statement, values)
+        
+        execute_with_retry(aio_session, batch)
+        return len(batch_data)
+    except Exception as e:
+        logging.warning(f"Batch insert failed: {e}. Falling back to individual inserts...")
+        # Fallback: insert one by one
+        success_count = 0
+        for values in batch_data:
+            try:
+                execute_with_retry(aio_session, insert_statement, values)
+                success_count += 1
+            except Exception as insert_err:
+                logging.error(f"Failed to insert row: {insert_err}")
+        return success_count
+
+
+# --- Table Copy Function with Optimized Performance ---
+def copy_table(impact_session, aio_session, table_name, org_id, fetch_size=100, max_retries=3, retry_delay=5):
+    """Copies data for a specific table from IMPACT to AIO with optimized performance."""
     keyspace = "precinct"
     full_table_name = f"{keyspace}.{table_name}"
 
     # Define insert queries and columns based on table name
-    # Note: Adjust column names if they differ significantly in the actual schema
     if table_name in ["objects", "reports"]:
         insert_query_str = f"INSERT INTO {full_table_name} (partition, created_at, object) VALUES (?, ?, ?);"
         cols_to_copy = ('partition', 'created_at', 'object')
     elif table_name in ["incident_to_partition", "partition_index", "incident_summary", "incidents"]:
         insert_query_str = f"INSERT INTO {full_table_name} (partition, created_at, incident) VALUES (?, ?, ?);"
-        # Assuming the third column is 'incident' for these tables based on name
         cols_to_copy = ('partition', 'created_at', 'incident')
     else:
-        print(f"Error: Unknown table structure for {table_name}")
+        logging.error(f"Unknown table structure for {table_name}")
         return
 
     for attempt in range(max_retries + 1):
         try:
-            print(f"\nAttempt {attempt + 1}/{max_retries + 1} to copy {full_table_name}...")
+            logging.info(f"\nAttempt {attempt + 1}/{max_retries + 1} to copy {full_table_name}...")
             source_row = 0
             consistency_level = ConsistencyLevel.QUORUM
             
-            # 1. First query - only get lightweight fields (org_id, partition, created_at)
-            print(f"Querying lightweight fields to identify relevant rows with consistency {get_consistency_name(consistency_level)}. This will do a complete table scan and may take a while...")
+            # 1. Scan table for matching rows
+            logging.info(f"Querying lightweight fields with consistency {get_consistency_name(consistency_level)}...")
             lightweight_query = f"SELECT org_id, partition, created_at FROM {full_table_name};"
             lightweight_statement = impact_session.prepare(lightweight_query)
             lightweight_statement.consistency_level = consistency_level
             lightweight_statement.fetch_size = fetch_size
             
             try:
-                lightweight_rows = impact_session.execute(lightweight_statement)
-            except (Unavailable, ReadTimeout, WriteTimeout) as consistency_error:
-                print(f"Consistency QUORUM failed: {consistency_error}")
-                print(f"Retrying with consistency ONE...")
-                consistency_level = ConsistencyLevel.ONE
-                lightweight_statement.consistency_level = consistency_level
-                lightweight_rows = impact_session.execute(lightweight_statement)
+                lightweight_rows = execute_with_retry(impact_session, lightweight_statement)
+            except Exception as e:
+                logging.error(f"Failed to execute lightweight query: {e}")
+                raise
 
-            # Store the partition and created_at values that match our org_id
+            # Collect matching keys
             matching_keys = []
-
-            # Initialize progress bar for scanning rows
             with tqdm(total=fetch_size, desc="Scanning rows", unit="row") as scan_pbar:
                 for row in lightweight_rows:
-                    # For every 1000 source rows, wait for 1 second to cool down the server
                     if source_row % 1000 == 0 and source_row > 0:
-                        time.sleep(1)
+                        time.sleep(0.5)  # Reduced cooldown time
                     source_row += 1
-                    scan_pbar.total = source_row  # Dynamically update total rows scanned
+                    scan_pbar.total = source_row
                     scan_pbar.refresh()
 
                     if hasattr(row, 'org_id') and row.org_id == org_id:
@@ -143,120 +229,147 @@ def copy_table(impact_session, aio_session, table_name, org_id, fetch_size=10, m
 
                     scan_pbar.update(1)
 
-            print(f"Found {len(matching_keys)} rows matching org_id {org_id}")
+            logging.info(f"Found {len(matching_keys)} rows matching org_id {org_id}")
+            
+            if len(matching_keys) == 0:
+                logging.warning(f"No rows found for org_id {org_id} in {full_table_name}")
+                return
             
             # 2. Truncate Destination Table
-            print(f"Truncating {full_table_name} in AIO with consistency {get_consistency_name(consistency_level)}...")
+            logging.info(f"Truncating {full_table_name} in AIO...")
             truncate_query = f"TRUNCATE {full_table_name};"
             truncate_statement = aio_session.prepare(truncate_query)
             truncate_statement.consistency_level = consistency_level
             
             try:
-                aio_session.execute(truncate_statement)
-                print(f"Truncate complete.")
-            except (Unavailable, ReadTimeout, WriteTimeout) as consistency_error:
-                print(f"Consistency QUORUM failed for truncate: {consistency_error}")
-                print(f"Retrying truncate with consistency ONE...")
-                consistency_level = ConsistencyLevel.ONE
-                truncate_statement.consistency_level = consistency_level
-                aio_session.execute(truncate_statement)
-                print(f"Truncate complete.")
+                execute_with_retry(aio_session, truncate_statement)
+                logging.info("Truncate complete.")
+            except Exception as e:
+                logging.error(f"Failed to truncate table: {e}")
+                raise
 
-            # 3. Fetch and insert only the matching rows with all columns
-            print(f"Fetching and copying full data for matching rows with consistency {get_consistency_name(consistency_level)}...")
+            # 3. Fetch and insert data with parallel processing
+            logging.info(f"Fetching and copying data with {MAX_WORKERS} parallel workers...")
             insert_statement = aio_session.prepare(insert_query_str)
             insert_statement.consistency_level = consistency_level
             moved = 0
-            batch_size = 10  # Fetch 10 rows at a time to avoid timeouts
+            failed = 0
+            batch_data = []
 
-            # Initialize progress bar
             with tqdm(total=len(matching_keys), desc="Copying rows", unit="row") as pbar:
-                # Process matching keys in batches
-                for batch_start in range(0, len(matching_keys), batch_size):
-                    batch_end = min(batch_start + batch_size, len(matching_keys))
-                    batch_keys = matching_keys[batch_start:batch_end]
+                # Process in chunks for better memory management
+                for chunk_start in range(0, len(matching_keys), FETCH_BATCH_SIZE):
+                    chunk_end = min(chunk_start + FETCH_BATCH_SIZE, len(matching_keys))
+                    chunk_keys = matching_keys[chunk_start:chunk_end]
                     
-                    for partition, created_at in batch_keys:
-                        try:
-                            # Query the specific row using partition, created_at, and org_id as filters
-                            detailed_query = f"SELECT {', '.join(cols_to_copy)} FROM {full_table_name} WHERE partition = ? AND created_at = ? AND org_id = ?;"
-                            detailed_statement = impact_session.prepare(detailed_query)
-                            detailed_statement.consistency_level = consistency_level
-                            
+                    # Parallel fetch
+                    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                        future_to_key = {
+                            executor.submit(
+                                fetch_row_data,
+                                impact_session,
+                                full_table_name,
+                                cols_to_copy,
+                                partition,
+                                created_at,
+                                org_id,
+                                consistency_level
+                            ): (partition, created_at)
+                            for partition, created_at in chunk_keys
+                        }
+                        
+                        for future in as_completed(future_to_key):
+                            partition, created_at = future_to_key[future]
                             try:
-                                detailed_row = impact_session.execute(detailed_statement, [partition, created_at, org_id]).one()
-                            except (Unavailable, ReadTimeout, WriteTimeout) as consistency_error:
-                                # Retry individual row query with consistency ONE
-                                print(f"\nConsistency {get_consistency_name(consistency_level)} failed for row query: {consistency_error}")
-                                print(f"Retrying with consistency ONE...")
-                                detailed_statement.consistency_level = ConsistencyLevel.ONE
-                                detailed_row = impact_session.execute(detailed_statement, [partition, created_at, org_id]).one()
-
-                            if detailed_row:
-                                # Extract data using the defined column names
-                                values = tuple(getattr(detailed_row, col) for col in cols_to_copy)
-                                
-                                try:
-                                    aio_session.execute(insert_statement, values)
-                                except (Unavailable, ReadTimeout, WriteTimeout) as consistency_error:
-                                    # Retry insert with consistency ONE
-                                    print(f"\nConsistency {get_consistency_name(consistency_level)} failed for insert: {consistency_error}")
-                                    print(f"Retrying insert with consistency ONE...")
-                                    insert_statement.consistency_level = ConsistencyLevel.ONE
-                                    aio_session.execute(insert_statement, values)
-                                
-                                moved += 1
-
-                            # Update progress bar
-                            pbar.update(1)
-
-                        except AttributeError as ae:
-                            print(f"Warning: Skipping row due to missing attribute: {ae}. Partition: {partition}, created_at: {created_at}")
-                            pbar.update(1)
-                        except Exception as insert_err:
-                            print(f"Warning: Skipping row due to insert error: {insert_err}. Partition: {partition}, created_at: {created_at}")
-                            pbar.update(1)
+                                row_data = future.result()
+                                if row_data:
+                                    batch_data.append(row_data)
+                                    
+                                    # Insert in batches
+                                    if len(batch_data) >= BATCH_INSERT_SIZE:
+                                        inserted = insert_batch(aio_session, insert_statement, batch_data)
+                                        moved += inserted
+                                        failed += len(batch_data) - inserted
+                                        batch_data = []
+                                else:
+                                    failed += 1
+                            except Exception as e:
+                                logging.error(f"Error processing row ({partition}, {created_at}): {e}")
+                                failed += 1
+                            finally:
+                                pbar.update(1)
                     
-                    # Small delay between batches to avoid overwhelming the server
-                    if batch_end < len(matching_keys):
-                        time.sleep(0.1)
+                    # Small delay between chunks
+                    if chunk_end < len(matching_keys):
+                        time.sleep(0.05)
+                
+                # Insert remaining batch
+                if batch_data:
+                    inserted = insert_batch(aio_session, insert_statement, batch_data)
+                    moved += inserted
+                    failed += len(batch_data) - inserted
 
-            print(f"Successfully copied {moved} rows from {full_table_name} to AIO.")
-            return # Exit function on success
+            logging.info(f"Successfully copied {moved} rows from {full_table_name} to AIO.")
+            if failed > 0:
+                logging.warning(f"Failed to copy {failed} rows.")
+            return
             
-        except ReadTimeout as e:
-            print(f"Read timeout during copy of {full_table_name}: {e}")
+        except (ReadTimeout, Unavailable, WriteTimeout) as e:
+            logging.error(f"Cassandra error during copy of {full_table_name}: {e}")
             if attempt < max_retries:
-                print(f"Retrying in {retry_delay} seconds...")
+                logging.info(f"Retrying in {retry_delay} seconds...")
                 time.sleep(retry_delay)
             else:
-                print(f"Max retries reached for {full_table_name}. Aborting copy for this table.")
-                return # Exit function on failure after retries
+                logging.error(f"Max retries reached for {full_table_name}.")
+                raise
         except Exception as e:
-            # Catch other potential Cassandra errors or general exceptions
-            print(f"An unexpected error occurred during copy of {full_table_name}: {e}")
-            import traceback
-            traceback.print_exc() # Print stack trace for unexpected errors
-            print(f"Aborting copy for {full_table_name} due to unexpected error.")
-            return # Exit function on unexpected error
+            logging.error(f"Unexpected error during copy of {full_table_name}: {e}", exc_info=True)
+            raise
+
 
 # --- Main Execution Logic ---
 # Define tables to copy and their fetch sizes
 tables_to_copy = {
-    "objects": 1,
-    "reports": 1,
-    "incident_to_partition": 1,
-    "partition_index": 1,
-    "incident_summary": 1,
-    "incidents": 1
+    "objects": 100,
+    "reports": 100,
+    "incident_to_partition": 100,
+    "partition_index": 100,
+    "incident_summary": 100,
+    "incidents": 100
 }
 
 # Call the function for each table
+logging.info("Starting migration process...")
+migration_stats = {}
+
 for table, fetch_size in tables_to_copy.items():
-    copy_table(impact, aio, table, IMPACT_ORG_ID, fetch_size=fetch_size)
+    try:
+        start_time = time.time()
+        copy_table(impact, aio, table, IMPACT_ORG_ID, fetch_size=fetch_size)
+        elapsed_time = time.time() - start_time
+        migration_stats[table] = {
+            'status': 'SUCCESS',
+            'time': elapsed_time
+        }
+        logging.info(f"Completed {table} in {elapsed_time:.2f} seconds")
+    except Exception as e:
+        migration_stats[table] = {
+            'status': 'FAILED',
+            'error': str(e)
+        }
+        logging.error(f"Failed to migrate {table}: {e}")
 
 # --- Shutdown ---
-print("\nMigration process finished. Shutting down connections.")
+logging.info("\n" + "="*60)
+logging.info("Migration Summary:")
+for table, stats in migration_stats.items():
+    if stats['status'] == 'SUCCESS':
+        logging.info(f"  {table}: ✓ SUCCESS ({stats['time']:.2f}s)")
+    else:
+        logging.error(f"  {table}: ✗ FAILED - {stats.get('error', 'Unknown error')}")
+logging.info("="*60)
+
+logging.info("\nShutting down connections...")
 impact_cluster.shutdown()
 aio_cluster.shutdown()
-print("Connections closed.")
+logging.info("Migration process finished. Check migrator.log for details.")
