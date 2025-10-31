@@ -82,26 +82,44 @@ aio.default_consistency_level = ConsistencyLevel.ONE
 logging.info("Connection to AIO Cassandra server successful")
 
 # --- Schema Detection ---
-def detect_objects_table_schema(session):
+def detect_table_has_org_id(session, table_name):
     """
-    Detect if the objects table has org_id column.
+    Detect if a specific table has org_id column.
     Returns True if org_id exists, False otherwise.
     """
     try:
-        query = "SELECT column_name FROM system_schema.columns WHERE keyspace_name='precinct' AND table_name='objects' AND column_name='org_id'"
+        query = f"SELECT column_name FROM system_schema.columns WHERE keyspace_name='precinct' AND table_name='{table_name}' AND column_name='org_id'"
         result = session.execute(query)
         has_org_id = len(list(result)) > 0
-        logging.info(f"Schema detection: objects table {'HAS' if has_org_id else 'DOES NOT HAVE'} org_id column")
+        logging.info(f"Schema detection: {table_name} table {'HAS' if has_org_id else 'DOES NOT HAVE'} org_id column")
         return has_org_id
     except Exception as e:
-        logging.warning(f"Could not detect schema: {e}. Assuming old schema with org_id.")
+        logging.warning(f"Could not detect schema for {table_name}: {e}. Assuming old schema with org_id.")
         return True
 
-# Detect schemas
-SOURCE_HAS_ORG_ID = detect_objects_table_schema(impact)
-DEST_HAS_ORG_ID = detect_objects_table_schema(aio)
-logging.info(f"Source (IMPACT) schema: {'WITH org_id' if SOURCE_HAS_ORG_ID else 'WITHOUT org_id'}")
-logging.info(f"Destination (AIO) schema: {'WITH org_id' if DEST_HAS_ORG_ID else 'WITHOUT org_id'}")
+# Detect schemas for all relevant tables
+TABLES_TO_CHECK = ['objects', 'reports', 'incidents', 'incident_summary', 'partition_index', 'incident_to_partition']
+SOURCE_SCHEMAS = {}
+DEST_SCHEMAS = {}
+
+logging.info("Detecting source cluster (IMPACT) schemas...")
+for table in TABLES_TO_CHECK:
+    SOURCE_SCHEMAS[table] = detect_table_has_org_id(impact, table)
+
+logging.info("\nDetecting destination cluster (AIO) schemas...")
+for table in TABLES_TO_CHECK:
+    DEST_SCHEMAS[table] = detect_table_has_org_id(aio, table)
+
+logging.info("\n" + "="*80)
+logging.info("Schema Summary:")
+logging.info("="*80)
+for table in TABLES_TO_CHECK:
+    logging.info(f"  {table:25s} | Source: {'WITH org_id' if SOURCE_SCHEMAS[table] else 'NO org_id':15s} | Dest: {'WITH org_id' if DEST_SCHEMAS[table] else 'NO org_id':15s}")
+logging.info("="*80)
+
+# Backwards compatibility
+SOURCE_HAS_ORG_ID = SOURCE_SCHEMAS.get('objects', True)
+DEST_HAS_ORG_ID = DEST_SCHEMAS.get('objects', True)
 
 # --- Helper Functions ---
 def get_consistency_name(consistency_level):
@@ -244,72 +262,116 @@ def copy_objects_partition(impact_session, aio_session, partition_name, org_id, 
 
 def copy_table_with_org_filter(impact_session, aio_session, table_name, org_id, fetch_size=100, max_retries=3):
     """
-    Copy tables that have org_id filtering: reports, incidents, etc.
+    Copy tables that may have org_id filtering: reports, incidents, etc.
     Optimized for parallel processing with batching.
+    Handles both old schema (with org_id) and new schema (without org_id).
     """
     keyspace = "precinct"
     full_table_name = f"{keyspace}.{table_name}"
     
-    # Define columns based on table type
+    # Check if source and destination have org_id
+    source_has_org_id = SOURCE_SCHEMAS.get(table_name, True)
+    dest_has_org_id = DEST_SCHEMAS.get(table_name, False)
+    
+    # Determine data column name based on table type
     if table_name == "reports":
-        cols_to_copy = ('partition', 'created_at', 'org_id', 'object')
-        insert_query_str = f"INSERT INTO {full_table_name} (partition, created_at, org_id, object) VALUES (?, ?, ?, ?);"
+        data_col = 'object'
     elif table_name in ["incidents", "incident_to_partition", "partition_index", "incident_summary"]:
-        cols_to_copy = ('partition', 'created_at', 'org_id', 'incident')
-        insert_query_str = f"INSERT INTO {full_table_name} (partition, created_at, org_id, incident) VALUES (?, ?, ?, ?);"
+        data_col = 'incident'
     else:
         logging.error(f"Unknown table structure for {table_name}")
         return
+    
+    # Build column lists based on schemas
+    if source_has_org_id:
+        source_cols = ['partition', 'created_at', 'org_id', data_col]
+    else:
+        source_cols = ['partition', 'created_at', data_col]
+    
+    if dest_has_org_id:
+        dest_cols = ['partition', 'created_at', 'org_id', data_col]
+        dest_placeholders = '?, ?, ?, ?'
+    else:
+        dest_cols = ['partition', 'created_at', data_col]
+        dest_placeholders = '?, ?, ?'
+    
+    insert_query_str = f"INSERT INTO {full_table_name} ({', '.join(dest_cols)}) VALUES ({dest_placeholders});"
     
     for attempt in range(max_retries + 1):
         try:
             logging.info(f"\nAttempt {attempt + 1}/{max_retries + 1} to copy {full_table_name}...")
             consistency_level = ConsistencyLevel.ONE  # Use ONE for better performance
             
-            # 1. Scan for matching rows
-            logging.info(f"Scanning {full_table_name} for org_id {org_id}...")
-            lightweight_query = f"SELECT partition, created_at FROM {full_table_name} WHERE org_id = ? ALLOW FILTERING;"
-            lightweight_statement = impact_session.prepare(lightweight_query)
-            lightweight_statement.consistency_level = consistency_level
-            lightweight_statement.fetch_size = fetch_size
-            
-            try:
+            # 1. Scan for matching rows - adapt query based on source schema
+            if source_has_org_id:
+                logging.info(f"Scanning {full_table_name} for org_id {org_id}...")
+                lightweight_query = f"SELECT partition, created_at FROM {full_table_name} WHERE org_id = ? ALLOW FILTERING;"
+                lightweight_statement = impact_session.prepare(lightweight_query)
+                lightweight_statement.consistency_level = consistency_level
+                lightweight_statement.fetch_size = fetch_size
                 lightweight_rows = execute_with_retry(impact_session, lightweight_statement, [org_id])
-            except Exception as e:
-                logging.error(f"Failed to execute query: {e}")
-                raise
+            else:
+                # If source doesn't have org_id, we need to scan all rows
+                logging.info(f"Scanning all rows in {full_table_name} (no org_id filtering)...")
+                lightweight_query = f"SELECT partition, created_at FROM {full_table_name};"
+                lightweight_statement = impact_session.prepare(lightweight_query)
+                lightweight_statement.consistency_level = consistency_level
+                lightweight_statement.fetch_size = fetch_size
+                lightweight_rows = execute_with_retry(impact_session, lightweight_statement)
             
             # Collect all matching keys
             matching_keys = []
             for row in tqdm(lightweight_rows, desc=f"Scanning {table_name}", unit="row"):
                 matching_keys.append((row.partition, row.created_at))
             
-            logging.info(f"Found {len(matching_keys)} rows for org_id {org_id}")
+            logging.info(f"Found {len(matching_keys)} rows")
             
             if len(matching_keys) == 0:
-                logging.warning(f"No rows found for org_id {org_id} in {full_table_name}")
+                logging.warning(f"No rows found in {full_table_name}")
                 return
             
-            # 2. Delete existing data for this org in AIO (more efficient than truncate)
-            logging.info(f"Deleting existing data for org_id {org_id} from AIO...")
-            delete_query = f"DELETE FROM {full_table_name} WHERE partition = ? AND created_at = ? AND org_id = ?;"
-            delete_stmt = aio_session.prepare(delete_query)
-            delete_stmt.consistency_level = consistency_level
-            
-            # Delete in batches
-            for i in tqdm(range(0, len(matching_keys), BATCH_INSERT_SIZE), desc="Deleting old data", unit="batch"):
-                batch_keys = matching_keys[i:i + BATCH_INSERT_SIZE]
-                batch = BatchStatement(consistency_level=consistency_level)
-                for partition, created_at in batch_keys:
-                    batch.add(delete_stmt, [partition, created_at, org_id])
-                try:
-                    execute_with_retry(aio_session, batch)
-                except Exception as e:
-                    logging.warning(f"Batch delete failed: {e}")
+            # 2. Delete existing data in AIO - adapt based on destination schema
+            logging.info(f"Deleting existing data from AIO...")
+            if dest_has_org_id:
+                delete_query = f"DELETE FROM {full_table_name} WHERE partition = ? AND created_at = ? AND org_id = ?;"
+                delete_stmt = aio_session.prepare(delete_query)
+                delete_stmt.consistency_level = consistency_level
+                
+                # Delete in batches
+                for i in tqdm(range(0, len(matching_keys), BATCH_INSERT_SIZE), desc="Deleting old data", unit="batch"):
+                    batch_keys = matching_keys[i:i + BATCH_INSERT_SIZE]
+                    batch = BatchStatement(consistency_level=consistency_level)
+                    for partition, created_at in batch_keys:
+                        batch.add(delete_stmt, [partition, created_at, org_id])
+                    try:
+                        execute_with_retry(aio_session, batch)
+                    except Exception as e:
+                        logging.warning(f"Batch delete failed: {e}")
+            else:
+                delete_query = f"DELETE FROM {full_table_name} WHERE partition = ? AND created_at = ?;"
+                delete_stmt = aio_session.prepare(delete_query)
+                delete_stmt.consistency_level = consistency_level
+                
+                # Delete in batches
+                for i in tqdm(range(0, len(matching_keys), BATCH_INSERT_SIZE), desc="Deleting old data", unit="batch"):
+                    batch_keys = matching_keys[i:i + BATCH_INSERT_SIZE]
+                    batch = BatchStatement(consistency_level=consistency_level)
+                    for partition, created_at in batch_keys:
+                        batch.add(delete_stmt, [partition, created_at])
+                    try:
+                        execute_with_retry(aio_session, batch)
+                    except Exception as e:
+                        logging.warning(f"Batch delete failed: {e}")
             
             # 3. Fetch and insert data with parallel processing
             logging.info(f"Copying data with {MAX_WORKERS} parallel workers...")
-            detail_query = f"SELECT {', '.join(cols_to_copy)} FROM {full_table_name} WHERE partition = ? AND created_at = ? AND org_id = ?;"
+            
+            # Build detail query based on source schema
+            if source_has_org_id:
+                detail_query = f"SELECT {', '.join(source_cols)} FROM {full_table_name} WHERE partition = ? AND created_at = ? AND org_id = ?;"
+            else:
+                detail_query = f"SELECT {', '.join(source_cols)} FROM {full_table_name} WHERE partition = ? AND created_at = ?;"
+            
             detail_stmt = impact_session.prepare(detail_query)
             detail_stmt.consistency_level = consistency_level
             
@@ -322,10 +384,17 @@ def copy_table_with_org_filter(impact_session, aio_session, table_name, org_id, 
             
             def fetch_row(partition, created_at):
                 try:
-                    result = execute_with_retry(impact_session, detail_stmt, [partition, created_at, org_id])
+                    if source_has_org_id:
+                        result = execute_with_retry(impact_session, detail_stmt, [partition, created_at, org_id])
+                    else:
+                        result = execute_with_retry(impact_session, detail_stmt, [partition, created_at])
                     row = result.one()
                     if row:
-                        return tuple(getattr(row, col) for col in cols_to_copy)
+                        # Extract data based on source schema
+                        if source_has_org_id:
+                            return (row.partition, row.created_at, row.org_id, getattr(row, data_col))
+                        else:
+                            return (row.partition, row.created_at, getattr(row, data_col))
                     return None
                 except Exception as e:
                     logging.warning(f"Failed to fetch row: {e}")
@@ -347,7 +416,18 @@ def copy_table_with_org_filter(impact_session, aio_session, table_name, org_id, 
                             try:
                                 row_data = future.result()
                                 if row_data:
-                                    batch_data.append(row_data)
+                                    # Transform data if schemas differ
+                                    if source_has_org_id and not dest_has_org_id:
+                                        # Remove org_id from tuple (it's at index 2)
+                                        insert_data = (row_data[0], row_data[1], row_data[3])
+                                    elif not source_has_org_id and dest_has_org_id:
+                                        # Add org_id to tuple (insert at index 2)
+                                        insert_data = (row_data[0], row_data[1], org_id, row_data[2])
+                                    else:
+                                        # Schemas match, use as-is
+                                        insert_data = row_data
+                                    
+                                    batch_data.append(insert_data)
                                     
                                     if len(batch_data) >= BATCH_INSERT_SIZE:
                                         batch = BatchStatement(consistency_level=consistency_level)
