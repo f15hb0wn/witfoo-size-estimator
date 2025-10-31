@@ -51,12 +51,11 @@ timeout_config = {
 # Connect to IMPACT cluster
 impact_auth_provider = PlainTextAuthProvider(IMPACT_CLUSTER_USERNAME, IMPACT_CLUSTER_PASSWORD)
 impact_cluster = Cluster(
-    [IMPACT_CLUSTER_SEED_NODES],
+    contact_points=[IMPACT_CLUSTER_SEED_NODES],  # Only use specified node
     auth_provider=impact_auth_provider,
     ssl_context=ssl_context,
     protocol_version=4,
     load_balancing_policy=None,  # Disable load balancing
-    contact_points=[IMPACT_CLUSTER_SEED_NODES],  # Only use specified node
     **timeout_config
 )
 logging.info("Connecting to IMPACT Cassandra server (single node only)...")
@@ -68,12 +67,11 @@ logging.info("Connection to IMPACT Cassandra server successful")
 # Connect to AIO cluster
 aio_auth_provider = PlainTextAuthProvider(AIO_USERNAME, AIO_PASSWORD)
 aio_cluster = Cluster(
-    [AIO_IP],
+    contact_points=[AIO_IP],  # Only use specified node
     auth_provider=aio_auth_provider,
     ssl_context=ssl_context,
     protocol_version=4,
     load_balancing_policy=None,  # Disable load balancing
-    contact_points=[AIO_IP],  # Only use specified node
     **timeout_config
 )
 logging.info("Connecting to AIO Cassandra server (single node only)...")
