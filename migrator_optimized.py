@@ -168,9 +168,21 @@ def execute_with_retry(session, statement, params=None, max_retries=2):
     for retry in range(max_retries + 1):
         try:
             if params:
-                return session.execute(statement, params)
+                result = session.execute(statement, params)
             else:
-                return session.execute(statement)
+                result = session.execute(statement)
+            
+            # Check for gc_grace_seconds warning and pause if detected
+            if hasattr(result, 'warnings') and result.warnings:
+                for warning in result.warnings:
+                    if 'gc_grace_seconds' in warning:
+                        logging.warning(f"Server warning detected: {warning}")
+                        logging.warning("Pausing for 30 seconds to allow batchlog entries to be processed...")
+                        time.sleep(30)
+                        break
+            
+            return result
+            
         except (Unavailable, ReadTimeout, WriteTimeout) as e:
             if retry < max_retries:
                 if statement.consistency_level == ConsistencyLevel.QUORUM:
