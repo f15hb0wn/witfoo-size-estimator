@@ -81,6 +81,28 @@ aio.default_timeout = 600
 aio.default_consistency_level = ConsistencyLevel.ONE
 logging.info("Connection to AIO Cassandra server successful")
 
+# --- Schema Detection ---
+def detect_objects_table_schema(session):
+    """
+    Detect if the objects table has org_id column.
+    Returns True if org_id exists, False otherwise.
+    """
+    try:
+        query = "SELECT column_name FROM system_schema.columns WHERE keyspace_name='precinct' AND table_name='objects' AND column_name='org_id'"
+        result = session.execute(query)
+        has_org_id = len(list(result)) > 0
+        logging.info(f"Schema detection: objects table {'HAS' if has_org_id else 'DOES NOT HAVE'} org_id column")
+        return has_org_id
+    except Exception as e:
+        logging.warning(f"Could not detect schema: {e}. Assuming old schema with org_id.")
+        return True
+
+# Detect schemas
+SOURCE_HAS_ORG_ID = detect_objects_table_schema(impact)
+DEST_HAS_ORG_ID = detect_objects_table_schema(aio)
+logging.info(f"Source (IMPACT) schema: {'WITH org_id' if SOURCE_HAS_ORG_ID else 'WITHOUT org_id'}")
+logging.info(f"Destination (AIO) schema: {'WITH org_id' if DEST_HAS_ORG_ID else 'WITHOUT org_id'}")
+
 # --- Helper Functions ---
 def get_consistency_name(consistency_level):
     """Get the name of a consistency level."""
@@ -127,6 +149,10 @@ def copy_objects_partition(impact_session, aio_session, partition_name, org_id, 
     """
     Copy specific partition from objects table (users, settings, etc.).
     These are small single-row partitions stored as JSON blobs.
+    
+    Handles both schema versions:
+    - Old: PRIMARY KEY ((org_id, partition), created_at) - with org_id column
+    - New: PRIMARY KEY (partition, created_at) - without org_id column
     """
     keyspace = "precinct"
     table = "objects"
@@ -135,12 +161,18 @@ def copy_objects_partition(impact_session, aio_session, partition_name, org_id, 
     logging.info(f"  Copying partition '{partition_name}' from {table}...")
     
     try:
-        # Query for this specific partition
-        query = f"SELECT partition, created_at, object FROM {full_table_name} WHERE partition = ? AND org_id = ?;"
-        statement = impact_session.prepare(query)
-        statement.consistency_level = consistency_level
+        # Query from source - adapt based on source schema
+        if SOURCE_HAS_ORG_ID:
+            query = f"SELECT partition, created_at, object FROM {full_table_name} WHERE partition = ? AND org_id = ?;"
+            statement = impact_session.prepare(query)
+            statement.consistency_level = consistency_level
+            rows = execute_with_retry(impact_session, statement, [partition_name, org_id])
+        else:
+            query = f"SELECT partition, created_at, object FROM {full_table_name} WHERE partition = ?;"
+            statement = impact_session.prepare(query)
+            statement.consistency_level = consistency_level
+            rows = execute_with_retry(impact_session, statement, [partition_name])
         
-        rows = execute_with_retry(impact_session, statement, [partition_name, org_id])
         rows_list = list(rows)
         
         if not rows_list:
@@ -149,29 +181,58 @@ def copy_objects_partition(impact_session, aio_session, partition_name, org_id, 
         
         logging.info(f"  Found {len(rows_list)} rows for partition '{partition_name}'")
         
-        # Delete existing data for this partition in AIO
-        delete_query = f"DELETE FROM {full_table_name} WHERE partition = ? AND org_id = ?;"
-        delete_stmt = aio_session.prepare(delete_query)
-        delete_stmt.consistency_level = consistency_level
-        execute_with_retry(aio_session, delete_stmt, [partition_name, org_id])
-        
-        # Insert data
-        insert_query = f"INSERT INTO {full_table_name} (partition, created_at, org_id, object) VALUES (?, ?, ?, ?);"
-        insert_stmt = aio_session.prepare(insert_query)
-        insert_stmt.consistency_level = consistency_level
-        
-        inserted = 0
-        for row in rows_list:
+        # Delete existing data for this partition in AIO - adapt based on destination schema
+        if DEST_HAS_ORG_ID:
+            delete_query = f"DELETE FROM {full_table_name} WHERE partition = ? AND org_id = ?;"
+            delete_stmt = aio_session.prepare(delete_query)
+            delete_stmt.consistency_level = consistency_level
             try:
-                execute_with_retry(aio_session, insert_stmt, [
-                    row.partition,
-                    row.created_at,
-                    org_id,
-                    row.object
-                ])
-                inserted += 1
+                execute_with_retry(aio_session, delete_stmt, [partition_name, org_id])
             except Exception as e:
-                logging.error(f"  Failed to insert row for partition '{partition_name}': {e}")
+                logging.warning(f"  Could not delete existing data (may not exist): {e}")
+        else:
+            delete_query = f"DELETE FROM {full_table_name} WHERE partition = ?;"
+            delete_stmt = aio_session.prepare(delete_query)
+            delete_stmt.consistency_level = consistency_level
+            try:
+                execute_with_retry(aio_session, delete_stmt, [partition_name])
+            except Exception as e:
+                logging.warning(f"  Could not delete existing data (may not exist): {e}")
+        
+        # Insert data - adapt based on destination schema
+        if DEST_HAS_ORG_ID:
+            insert_query = f"INSERT INTO {full_table_name} (partition, created_at, org_id, object) VALUES (?, ?, ?, ?);"
+            insert_stmt = aio_session.prepare(insert_query)
+            insert_stmt.consistency_level = consistency_level
+            
+            inserted = 0
+            for row in rows_list:
+                try:
+                    execute_with_retry(aio_session, insert_stmt, [
+                        row.partition,
+                        row.created_at,
+                        org_id,
+                        row.object
+                    ])
+                    inserted += 1
+                except Exception as e:
+                    logging.error(f"  Failed to insert row for partition '{partition_name}': {e}")
+        else:
+            insert_query = f"INSERT INTO {full_table_name} (partition, created_at, object) VALUES (?, ?, ?);"
+            insert_stmt = aio_session.prepare(insert_query)
+            insert_stmt.consistency_level = consistency_level
+            
+            inserted = 0
+            for row in rows_list:
+                try:
+                    execute_with_retry(aio_session, insert_stmt, [
+                        row.partition,
+                        row.created_at,
+                        row.object
+                    ])
+                    inserted += 1
+                except Exception as e:
+                    logging.error(f"  Failed to insert row for partition '{partition_name}': {e}")
         
         logging.info(f"  Successfully copied {inserted}/{len(rows_list)} rows for partition '{partition_name}'")
         return inserted
