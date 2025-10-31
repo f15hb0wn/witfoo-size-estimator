@@ -43,9 +43,9 @@ TRUNCATE_BEFORE_COPY = config.get('TRUNCATE_BEFORE_COPY', False)  # Truncate tab
 
 # Table-specific batch sizes (for tables with large blob data)
 TABLE_BATCH_SIZES = {
-    'reports': 10,  # Reports have large object blobs
-    'incidents': 15,  # Incidents can be large
-    'incident_summary': 20,
+    'reports': 5,   # Reports have very large object blobs - use small batches
+    'incidents': 10,  # Incidents can be large
+    'incident_summary': 15,
     'objects': 50,  # Objects are usually smaller
 }
 
@@ -477,20 +477,15 @@ def copy_table_with_org_filter(impact_session, aio_session, table_name, org_id, 
                                         except Exception as e:
                                             error_msg = str(e)
                                             if "Batch too large" in error_msg:
-                                                # Retry with smaller batches
-                                                logging.warning(f"Batch too large ({len(batch_data)} rows), splitting into smaller batches...")
-                                                small_batch_size = max(1, len(batch_data) // 4)
-                                                for j in range(0, len(batch_data), small_batch_size):
-                                                    small_batch = BatchStatement(consistency_level=consistency_level)
-                                                    small_data = batch_data[j:j + small_batch_size]
-                                                    for values in small_data:
-                                                        small_batch.add(insert_statement, values)
+                                                # Insert rows individually instead of batching
+                                                logging.warning(f"Batch too large ({len(batch_data)} rows), inserting individually...")
+                                                for values in batch_data:
                                                     try:
-                                                        execute_with_retry(aio_session, small_batch)
-                                                        moved += len(small_data)
+                                                        execute_with_retry(aio_session, insert_statement, values)
+                                                        moved += 1
                                                     except Exception as e2:
-                                                        logging.error(f"Small batch insert failed: {e2}")
-                                                        failed += len(small_data)
+                                                        logging.error(f"Individual insert failed: {e2}")
+                                                        failed += 1
                                             else:
                                                 logging.warning(f"Batch insert failed: {e}")
                                                 failed += len(batch_data)
@@ -514,20 +509,15 @@ def copy_table_with_org_filter(impact_session, aio_session, table_name, org_id, 
                     except Exception as e:
                         error_msg = str(e)
                         if "Batch too large" in error_msg:
-                            # Retry with smaller batches
-                            logging.warning(f"Final batch too large ({len(batch_data)} rows), splitting into smaller batches...")
-                            small_batch_size = max(1, len(batch_data) // 4)
-                            for j in range(0, len(batch_data), small_batch_size):
-                                small_batch = BatchStatement(consistency_level=consistency_level)
-                                small_data = batch_data[j:j + small_batch_size]
-                                for values in small_data:
-                                    small_batch.add(insert_statement, values)
+                            # Insert rows individually instead of batching
+                            logging.warning(f"Final batch too large ({len(batch_data)} rows), inserting individually...")
+                            for values in batch_data:
                                 try:
-                                    execute_with_retry(aio_session, small_batch)
-                                    moved += len(small_data)
+                                    execute_with_retry(aio_session, insert_statement, values)
+                                    moved += 1
                                 except Exception as e2:
-                                    logging.error(f"Small batch insert failed: {e2}")
-                                    failed += len(small_data)
+                                    logging.error(f"Individual insert failed: {e2}")
+                                    failed += 1
                         else:
                             logging.warning(f"Final batch insert failed: {e}")
                             failed += len(batch_data)
