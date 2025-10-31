@@ -55,9 +55,11 @@ impact_cluster = Cluster(
     auth_provider=impact_auth_provider,
     ssl_context=ssl_context,
     protocol_version=4,
+    load_balancing_policy=None,  # Disable load balancing
+    contact_points=[IMPACT_CLUSTER_SEED_NODES],  # Only use specified node
     **timeout_config
 )
-logging.info("Connecting to IMPACT Cassandra server...")
+logging.info("Connecting to IMPACT Cassandra server (single node only)...")
 impact = impact_cluster.connect()
 impact.default_timeout = 600
 impact.default_consistency_level = ConsistencyLevel.QUORUM
@@ -70,9 +72,11 @@ aio_cluster = Cluster(
     auth_provider=aio_auth_provider,
     ssl_context=ssl_context,
     protocol_version=4,
+    load_balancing_policy=None,  # Disable load balancing
+    contact_points=[AIO_IP],  # Only use specified node
     **timeout_config
 )
-logging.info("Connecting to AIO Cassandra server...")
+logging.info("Connecting to AIO Cassandra server (single node only)...")
 aio = aio_cluster.connect()
 aio.default_timeout = 600
 aio.default_consistency_level = ConsistencyLevel.ONE
