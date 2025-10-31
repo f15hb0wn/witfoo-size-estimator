@@ -43,10 +43,10 @@ TRUNCATE_BEFORE_COPY = config.get('TRUNCATE_BEFORE_COPY', False)  # Truncate tab
 
 # Table-specific batch sizes (for tables with large blob data)
 TABLE_BATCH_SIZES = {
-    'reports': 5,   # Reports have very large object blobs - use small batches
-    'incidents': 10,  # Incidents can be large
-    'incident_summary': 15,
-    'objects': 50,  # Objects are usually smaller
+    'reports': 1,   # Reports have very large object blobs - use small batches
+    'incidents': 1,  # Incidents can be large
+    'incident_summary': 1,
+    'objects': 5,  # Objects are usually smaller
 }
 
 # --- Cassandra Connections ---
