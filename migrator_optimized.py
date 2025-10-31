@@ -35,8 +35,16 @@ AIO_PASSWORD = config['AIO_PASSWORD']
 
 # Performance tuning parameters
 MAX_WORKERS = config.get('MAX_WORKERS', 10)  # Increased for smaller tables
-BATCH_INSERT_SIZE = config.get('BATCH_INSERT_SIZE', 100)  # Increased batch size
+BATCH_INSERT_SIZE = config.get('BATCH_INSERT_SIZE', 25)  # Reduced for large objects
 FETCH_BATCH_SIZE = config.get('FETCH_BATCH_SIZE', 200)  # Increased chunk size
+
+# Table-specific batch sizes (for tables with large blob data)
+TABLE_BATCH_SIZES = {
+    'reports': 10,  # Reports have large object blobs
+    'incidents': 15,  # Incidents can be large
+    'incident_summary': 20,
+    'objects': 50,  # Objects are usually smaller
+}
 
 # --- Cassandra Connections ---
 ssl_context = SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -269,6 +277,10 @@ def copy_table_with_org_filter(impact_session, aio_session, table_name, org_id, 
     keyspace = "precinct"
     full_table_name = f"{keyspace}.{table_name}"
     
+    # Use table-specific batch size if available, otherwise use default
+    batch_size = TABLE_BATCH_SIZES.get(table_name, BATCH_INSERT_SIZE)
+    logging.info(f"Using batch size of {batch_size} for {table_name}")
+    
     # Check if source and destination have org_id
     source_has_org_id = SOURCE_SCHEMAS.get(table_name, True)
     dest_has_org_id = DEST_SCHEMAS.get(table_name, False)
@@ -338,8 +350,8 @@ def copy_table_with_org_filter(impact_session, aio_session, table_name, org_id, 
                 delete_stmt.consistency_level = consistency_level
                 
                 # Delete in batches
-                for i in tqdm(range(0, len(matching_keys), BATCH_INSERT_SIZE), desc="Deleting old data", unit="batch"):
-                    batch_keys = matching_keys[i:i + BATCH_INSERT_SIZE]
+                for i in tqdm(range(0, len(matching_keys), batch_size), desc="Deleting old data", unit="batch"):
+                    batch_keys = matching_keys[i:i + batch_size]
                     batch = BatchStatement(consistency_level=consistency_level)
                     for partition, created_at in batch_keys:
                         batch.add(delete_stmt, [partition, created_at, org_id])
@@ -353,8 +365,8 @@ def copy_table_with_org_filter(impact_session, aio_session, table_name, org_id, 
                 delete_stmt.consistency_level = consistency_level
                 
                 # Delete in batches
-                for i in tqdm(range(0, len(matching_keys), BATCH_INSERT_SIZE), desc="Deleting old data", unit="batch"):
-                    batch_keys = matching_keys[i:i + BATCH_INSERT_SIZE]
+                for i in tqdm(range(0, len(matching_keys), batch_size), desc="Deleting old data", unit="batch"):
+                    batch_keys = matching_keys[i:i + batch_size]
                     batch = BatchStatement(consistency_level=consistency_level)
                     for partition, created_at in batch_keys:
                         batch.add(delete_stmt, [partition, created_at])
@@ -429,7 +441,7 @@ def copy_table_with_org_filter(impact_session, aio_session, table_name, org_id, 
                                     
                                     batch_data.append(insert_data)
                                     
-                                    if len(batch_data) >= BATCH_INSERT_SIZE:
+                                    if len(batch_data) >= batch_size:
                                         batch = BatchStatement(consistency_level=consistency_level)
                                         for values in batch_data:
                                             batch.add(insert_statement, values)
@@ -437,8 +449,25 @@ def copy_table_with_org_filter(impact_session, aio_session, table_name, org_id, 
                                             execute_with_retry(aio_session, batch)
                                             moved += len(batch_data)
                                         except Exception as e:
-                                            logging.warning(f"Batch insert failed: {e}")
-                                            failed += len(batch_data)
+                                            error_msg = str(e)
+                                            if "Batch too large" in error_msg:
+                                                # Retry with smaller batches
+                                                logging.warning(f"Batch too large ({len(batch_data)} rows), splitting into smaller batches...")
+                                                small_batch_size = max(1, len(batch_data) // 4)
+                                                for j in range(0, len(batch_data), small_batch_size):
+                                                    small_batch = BatchStatement(consistency_level=consistency_level)
+                                                    small_data = batch_data[j:j + small_batch_size]
+                                                    for values in small_data:
+                                                        small_batch.add(insert_statement, values)
+                                                    try:
+                                                        execute_with_retry(aio_session, small_batch)
+                                                        moved += len(small_data)
+                                                    except Exception as e2:
+                                                        logging.error(f"Small batch insert failed: {e2}")
+                                                        failed += len(small_data)
+                                            else:
+                                                logging.warning(f"Batch insert failed: {e}")
+                                                failed += len(batch_data)
                                         batch_data = []
                                 else:
                                     failed += 1
@@ -457,8 +486,25 @@ def copy_table_with_org_filter(impact_session, aio_session, table_name, org_id, 
                         execute_with_retry(aio_session, batch)
                         moved += len(batch_data)
                     except Exception as e:
-                        logging.warning(f"Final batch insert failed: {e}")
-                        failed += len(batch_data)
+                        error_msg = str(e)
+                        if "Batch too large" in error_msg:
+                            # Retry with smaller batches
+                            logging.warning(f"Final batch too large ({len(batch_data)} rows), splitting into smaller batches...")
+                            small_batch_size = max(1, len(batch_data) // 4)
+                            for j in range(0, len(batch_data), small_batch_size):
+                                small_batch = BatchStatement(consistency_level=consistency_level)
+                                small_data = batch_data[j:j + small_batch_size]
+                                for values in small_data:
+                                    small_batch.add(insert_statement, values)
+                                try:
+                                    execute_with_retry(aio_session, small_batch)
+                                    moved += len(small_data)
+                                except Exception as e2:
+                                    logging.error(f"Small batch insert failed: {e2}")
+                                    failed += len(small_data)
+                        else:
+                            logging.warning(f"Final batch insert failed: {e}")
+                            failed += len(batch_data)
             
             logging.info(f"Successfully copied {moved} rows from {full_table_name}")
             if failed > 0:

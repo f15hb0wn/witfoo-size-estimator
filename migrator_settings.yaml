@@ -8,5 +8,5 @@ AIO_PASSWORD: F00theN0ise!
 
 # Performance tuning parameters (optional - will use defaults if not specified)
 MAX_WORKERS: 5              # Number of parallel threads for fetching data (1-10 recommended)
-BATCH_INSERT_SIZE: 50       # Number of rows to insert in a single batch (10-100 recommended)
+BATCH_INSERT_SIZE: 25       # Default batch size (will be overridden for specific tables like reports)
 FETCH_BATCH_SIZE: 100       # Number of rows to process before taking a small break (50-500 recommended)
