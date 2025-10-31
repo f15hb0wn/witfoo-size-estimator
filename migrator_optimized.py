@@ -1,7 +1,7 @@
 import time
-from cassandra.cluster import Cluster
+from cassandra.cluster import Cluster, NoHostAvailable
 from cassandra.auth import PlainTextAuthProvider
-from cassandra import ReadTimeout, ConsistencyLevel, Unavailable, WriteTimeout, NoHostAvailable
+from cassandra import ReadTimeout, ConsistencyLevel, Unavailable, WriteTimeout
 from cassandra.query import BatchStatement, SimpleStatement
 from ssl import SSLContext, CERT_NONE, TLSVersion
 import ssl
