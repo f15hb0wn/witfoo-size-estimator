@@ -172,14 +172,14 @@ def execute_with_retry(session, statement, params=None, max_retries=2):
             else:
                 result = session.execute(statement)
             
-            # Check for gc_grace_seconds warning and pause if detected
+            # Check for warnings but suppress LOGGED BATCH warnings
             if hasattr(result, 'warnings') and result.warnings:
                 for warning in result.warnings:
-                    if 'gc_grace_seconds' in warning:
-                        logging.warning(f"Server warning detected: {warning}")
-                        logging.warning("Pausing for 30 seconds to allow batchlog entries to be processed...")
-                        time.sleep(30)
-                        break
+                    # Suppress "Executing a LOGGED BATCH" warnings
+                    if 'Executing a LOGGED BATCH' in warning:
+                        continue  # Skip logging this warning
+                    # Log other warnings
+                    logging.warning(f"Server warning: {warning}")
             
             return result
             
