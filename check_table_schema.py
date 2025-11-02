@@ -5,6 +5,7 @@ Quick script to check the actual schema of Cassandra tables
 import yaml
 from cassandra.cluster import Cluster
 from cassandra.auth import PlainTextAuthProvider
+from cassandra.policies import WhiteListRoundRobinPolicy
 from ssl import SSLContext, CERT_NONE, TLSVersion
 import ssl
 
@@ -31,9 +32,11 @@ timeout_config = {
 # Connect to IMPACT cluster
 impact_auth_provider = PlainTextAuthProvider(IMPACT_CLUSTER_USERNAME, IMPACT_CLUSTER_PASSWORD)
 impact_cluster = Cluster(
-    [IMPACT_CLUSTER_SEED_NODES],
+    contact_points=[IMPACT_CLUSTER_SEED_NODES],  # Only use specified node
     auth_provider=impact_auth_provider,
     ssl_context=ssl_context,
+    protocol_version=4,
+    load_balancing_policy=WhiteListRoundRobinPolicy([IMPACT_CLUSTER_SEED_NODES]),  # Restrict to only this host
     **timeout_config
 )
 
