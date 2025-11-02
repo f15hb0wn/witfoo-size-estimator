@@ -1,7 +1,7 @@
 # Schema Column Mapping Fix
 
 ## Problem
-The `incident_summary` table was using the wrong column name. The code was trying to access an `incident` column, but the actual column name is `summary`.
+The `incident_summary` table was incorrectly assumed to have an `incident` column. After inspecting the actual schema, it was discovered that `incident_summary` uses the `object` column.
 
 ## Solution Applied
 
@@ -17,39 +17,53 @@ elif table_name in ["incidents", "incident_to_partition", "partition_index", "in
 
 ### After:
 ```python
-if table_name == "reports":
+# Based on actual schema inspection - incident_summary uses 'object' column!
+if table_name in ["reports", "objects", "incident_summary"]:
     data_col = 'object'
-elif table_name == "objects":
-    data_col = 'object'
-elif table_name == "incident_summary":
-    data_col = 'summary'  # incident_summary uses 'summary' column
 elif table_name in ["incidents", "incident_to_partition", "partition_index"]:
     data_col = 'incident'
 ```
 
+## Actual Schema Discovery
+
+From running `check_table_schema.py`, the `incident_summary` table contains:
+- `count` - regular column
+- `created_at` - clustering key
+- `index` - regular column
+- **`object`** - regular column (the data column!)
+- `org_id` - regular column
+- `partition` - partition key
+
 ## Column Mappings by Table
 
-| Table Name               | Data Column Name |
-|-------------------------|------------------|
-| `objects`               | `object`         |
-| `reports`               | `object`         |
-| `incident_summary`      | `summary`        |
-| `incidents`             | `incident`       |
-| `incident_to_partition` | `incident`       |
-| `partition_index`       | `incident`       |
+| Table Name               | Data Column Name | Notes                    |
+|-------------------------|------------------|--------------------------|
+| `objects`               | `object`         |                          |
+| `reports`               | `object`         |                          |
+| **`incident_summary`**  | **`object`**     | **Fixed - was incorrect**|
+| `incidents`             | `incident`       |                          |
+| `incident_to_partition` | `incident`       |                          |
+| `partition_index`       | `incident`       |                          |
 
-## Verify Schema (Optional)
+## Schema Checker Fix
 
-If you want to verify the actual table schemas before running the migration, use the provided schema checker:
+Also fixed the schema checker script to remove the unsupported `ORDER BY position` clause. Now it:
+1. Queries columns without ordering
+2. Sorts them manually (partition keys → clustering keys → regular columns)
+3. Displays them in a readable format
+
+## Verify Schema
+
+Run the schema checker to see all table structures:
 
 ```bash
 python check_table_schema.py
 ```
 
 This will show you:
-1. All columns in each table
-2. Column types and kinds (partition key, clustering key, regular)
-3. A sample row from incident_summary showing available fields
+1. All columns in each table with their types
+2. Column kinds (partition_key, clustering, regular)
+3. Sample rows showing actual data structure
 
 ## Next Steps
 
@@ -60,11 +74,6 @@ This will show you:
 
 2. The error should be resolved and `incident_summary` should migrate successfully.
 
-3. If you encounter similar errors for other tables, check the schema output to confirm the correct column names.
+## Key Takeaway
 
-## Common Column Name Patterns
-
-- Tables storing raw data objects: `object` column
-- Tables storing incidents: `incident` column
-- Tables storing summaries: `summary` column
-- Always have: `partition`, `created_at` (and optionally `org_id`)
+**Don't assume table structures based on naming!** The `incident_summary` table name suggests it would have a `summary` or `incident` column, but it actually stores data in an `object` column just like `objects` and `reports` tables.

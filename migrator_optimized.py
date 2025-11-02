@@ -320,12 +320,9 @@ def copy_table_with_org_filter(impact_session, aio_session, table_name, org_id, 
     dest_has_org_id = DEST_SCHEMAS.get(table_name, False)
     
     # Determine data column name based on table type
-    if table_name == "reports":
+    # Based on actual schema inspection - incident_summary uses 'object' column!
+    if table_name in ["reports", "objects", "incident_summary"]:
         data_col = 'object'
-    elif table_name == "objects":
-        data_col = 'object'
-    elif table_name == "incident_summary":
-        data_col = 'summary'  # incident_summary uses 'summary' column
     elif table_name in ["incidents", "incident_to_partition", "partition_index"]:
         data_col = 'incident'
     else:

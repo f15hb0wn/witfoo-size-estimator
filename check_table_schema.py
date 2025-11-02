@@ -55,12 +55,11 @@ for table in tables:
     print(f"\nTable: precinct.{table}")
     print("-" * 80)
     
-    # Get all columns for this table
+    # Get all columns for this table (without ORDER BY which isn't supported)
     query = """
     SELECT column_name, type, kind 
     FROM system_schema.columns 
     WHERE keyspace_name='precinct' AND table_name=%s
-    ORDER BY position
     """
     
     try:
@@ -68,9 +67,15 @@ for table in tables:
         columns = list(result)
         
         if columns:
+            # Sort columns: partition keys first, then clustering keys, then regular
+            partition_keys = [c for c in columns if c.kind == 'partition_key']
+            clustering_keys = [c for c in columns if c.kind == 'clustering']
+            regular_cols = [c for c in columns if c.kind == 'regular']
+            sorted_columns = partition_keys + clustering_keys + regular_cols
+            
             print(f"  {'Column Name':<25} {'Type':<30} {'Kind':<15}")
             print("  " + "-" * 70)
-            for col in columns:
+            for col in sorted_columns:
                 print(f"  {col.column_name:<25} {col.type:<30} {col.kind:<15}")
         else:
             print(f"  No columns found or table doesn't exist")
