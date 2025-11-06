@@ -10,6 +10,8 @@ import yaml
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
+import json
+import os
 
 # Setup logging
 logging.basicConfig(
@@ -20,6 +22,50 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
+# --- Checkpoint Management ---
+CHECKPOINT_FILE = "migrator_checkpoint.json"
+
+def load_checkpoint():
+    """Load checkpoint data from file."""
+    if os.path.exists(CHECKPOINT_FILE):
+        with open(CHECKPOINT_FILE, 'r') as f:
+            return json.load(f)
+    return {"completed_tables": [], "completed_partitions": []}
+
+def save_checkpoint(checkpoint_data):
+    """Save checkpoint data to file."""
+    with open(CHECKPOINT_FILE, 'w') as f:
+        json.dump(checkpoint_data, f, indent=2)
+
+def mark_table_completed(checkpoint_data, table_name):
+    """Mark a table as completed in the checkpoint."""
+    if table_name not in checkpoint_data["completed_tables"]:
+        checkpoint_data["completed_tables"].append(table_name)
+        save_checkpoint(checkpoint_data)
+        logging.info(f"✓ Marked {table_name} as completed in checkpoint")
+
+def mark_partition_completed(checkpoint_data, partition_name):
+    """Mark a partition as completed in the checkpoint."""
+    partition_key = f"objects:{partition_name}"
+    if partition_key not in checkpoint_data["completed_partitions"]:
+        checkpoint_data["completed_partitions"].append(partition_key)
+        save_checkpoint(checkpoint_data)
+        logging.info(f"✓ Marked {partition_key} as completed in checkpoint")
+
+def is_table_completed(checkpoint_data, table_name):
+    """Check if a table has already been completed."""
+    return table_name in checkpoint_data["completed_tables"]
+
+def is_partition_completed(checkpoint_data, partition_name):
+    """Check if a partition has already been completed."""
+    partition_key = f"objects:{partition_name}"
+    return partition_key in checkpoint_data["completed_partitions"]
+
+# Load checkpoint at startup
+checkpoint = load_checkpoint()
+logging.info(f"Loaded checkpoint: {len(checkpoint['completed_tables'])} tables, {len(checkpoint['completed_partitions'])} partitions completed")
+
 
 # --- Configuration Loading ---
 with open('migrator_settings.yaml', 'r') as file:
@@ -137,7 +183,13 @@ def truncate_table(session, table_name):
     """
     Truncate a table in the destination cluster.
     WARNING: This permanently deletes all data in the table!
+    Skips truncation if the table has already been completed.
     """
+    # Check checkpoint before truncating
+    if is_table_completed(checkpoint, table_name):
+        logging.info(f"  ⏭️  Skipping truncation of {table_name} (already completed)")
+        return True
+    
     keyspace = "precinct"
     full_table_name = f"{keyspace}.{table_name}"
     try:
@@ -211,7 +263,14 @@ def copy_objects_partition(impact_session, aio_session, partition_name, org_id, 
     Handles both schema versions:
     - Old: PRIMARY KEY ((org_id, partition), created_at) - with org_id column
     - New: PRIMARY KEY (partition, created_at) - without org_id column
+    
+    Skips if already completed according to checkpoint.
     """
+    # Check checkpoint before copying
+    if is_partition_completed(checkpoint, partition_name):
+        logging.info(f"  ⏭️  Skipping partition '{partition_name}' (already completed)")
+        return 0
+    
     keyspace = "precinct"
     table = "objects"
     full_table_name = f"{keyspace}.{table}"
@@ -295,6 +354,10 @@ def copy_objects_partition(impact_session, aio_session, partition_name, org_id, 
                     logging.error(f"  Failed to insert row for partition '{partition_name}': {e}")
         
         logging.info(f"  Successfully copied {inserted}/{len(rows_list)} rows for partition '{partition_name}'")
+        
+        # Mark partition as completed
+        mark_partition_completed(checkpoint, partition_name)
+        
         return inserted
         
     except Exception as e:
@@ -307,7 +370,13 @@ def copy_table_with_org_filter(impact_session, aio_session, table_name, org_id, 
     Copy tables that may have org_id filtering: reports, incidents, etc.
     Optimized for parallel processing with batching.
     Handles both old schema (with org_id) and new schema (without org_id).
+    Skips if already completed according to checkpoint.
     """
+    # Check checkpoint before copying
+    if is_table_completed(checkpoint, table_name):
+        logging.info(f"  ⏭️  Skipping table '{table_name}' (already completed)")
+        return
+    
     keyspace = "precinct"
     full_table_name = f"{keyspace}.{table_name}"
     
@@ -491,6 +560,10 @@ def copy_table_with_org_filter(impact_session, aio_session, table_name, org_id, 
             logging.info(f"Successfully copied {moved} rows from {full_table_name}")
             if failed > 0:
                 logging.warning(f"Failed to copy {failed} rows")
+            
+            # Mark table as completed
+            mark_table_completed(checkpoint, table_name)
+            
             return
             
         except (ReadTimeout, Unavailable, WriteTimeout) as e:

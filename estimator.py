@@ -4,13 +4,44 @@ from ssl import SSLContext, CERT_NONE, TLSVersion
 import ssl
 from cassandra import ConsistencyLevel
 from getpass import getpass
+import json
+import os
+
+CHECKPOINT_FILE = "estimator_checkpoint.json"
+
+def load_checkpoint():
+    """Load checkpoint data from file."""
+    if os.path.exists(CHECKPOINT_FILE):
+        with open(CHECKPOINT_FILE, 'r') as f:
+            return json.load(f)
+    return {"completed_orgs": []}
+
+def save_checkpoint(checkpoint_data):
+    """Save checkpoint data to file."""
+    with open(CHECKPOINT_FILE, 'w') as f:
+        json.dump(checkpoint_data, f, indent=2)
 
 def connect_to_cassandra():
+    # Load checkpoint to see if we've already processed this org
+    checkpoint = load_checkpoint()
+    
     # Prompt user for connection details
     cassandra_ip = input("Enter the Cassandra server IP address: ")
     username = input("Enter the Cassandra username: ")
     password = getpass("Enter the Cassandra password: ")
     org_id = input("Enter the organization ID: ")
+    
+    # Check if this org has already been completed
+    if org_id in checkpoint.get("completed_orgs", []):
+        print(f"Organization {org_id} has already been processed. Skipping...")
+        response = input("Do you want to reprocess this organization? (yes/no): ")
+        if response.lower() not in ['yes', 'y']:
+            return
+        else:
+            # Remove from completed list to reprocess
+            checkpoint["completed_orgs"].remove(org_id)
+            save_checkpoint(checkpoint)
+    
     partition_size = input("Enter the partition size in bytes: ")
     # Validate partition size
     try:
@@ -87,6 +118,12 @@ def connect_to_cassandra():
             newest_day = f"{newest_day // 10000:04}-{(newest_day % 10000) // 100:02}-{newest_day % 100:02}"
             print(f"Newest day: {newest_day}")
             print(f"Oldest day: {oldest_day}")
+        
+        # Mark this org as completed
+        checkpoint["completed_orgs"].append(org_id)
+        save_checkpoint(checkpoint)
+        print(f"Organization {org_id} marked as completed in checkpoint.")
+        
         return session
     except Exception as e:
         print(f"Failed to connect to Cassandra server: {e}")
