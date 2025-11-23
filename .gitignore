@@ -1,0 +1,3 @@
+# Ignore new-users.json files and old-users.json files
+new-users.json
+old-users.json
