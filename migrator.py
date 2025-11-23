@@ -12,6 +12,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import json
 import os
+import hashlib
+import uuid
 
 # Setup logging
 logging.basicConfig(
@@ -255,6 +257,154 @@ def execute_with_retry(session, statement, params=None, max_retries=2):
     statement.consistency_level = original_consistency
 
 
+# --- User Transformation Functions ---
+def bcrypt_2a_to_2y(password_hash):
+    """Convert bcrypt $2a$ hash to $2y$ format."""
+    if password_hash and password_hash.startswith('$2a$'):
+        return password_hash.replace('$2a$', '$2y$', 1)
+    return password_hash
+
+
+def map_data_role_to_integer(data_roles_list):
+    """Map data role strings to integers. In new system: 0 = High access"""
+    return 0
+
+
+def generate_user_id(username, index, org_id_prefix=42218):
+    """
+    Generate a consistent integer ID for each user based on org ID.
+    Format: {org_id}{sequential_number}
+    Example: org_id=42218, first user=4221800001, second=4221800002
+    """
+    sequential_id = index + 1
+    user_id = int(f"{org_id_prefix}{sequential_id:05d}")
+    return user_id
+
+
+def map_function_role_label(function_role):
+    """Map function role integer to label."""
+    role_map = {1: "Admin", 2: "User", 3: "Read-Only"}
+    return role_map.get(function_role, "User")
+
+
+def map_data_role_label(data_role):
+    """Map data role integer to label."""
+    role_map = {0: "High", 1: "Medium", 2: "Low"}
+    return role_map.get(data_role, "High")
+
+
+def generate_api_token(username):
+    """Generate a pseudo API token from username hash."""
+    hash_obj = hashlib.sha256(username.encode())
+    return hash_obj.hexdigest()[:60]
+
+
+def transform_user(old_user, index, org_id_prefix=42218):
+    """Transform old IMPACT user format to new AIO format."""
+    username = old_user.get('username', '')
+    display_name = old_user.get('display_name', '')
+    if not display_name:
+        display_name = username.split('@')[0] if '@' in username else username
+    
+    old_password = old_user.get('password', '')
+    new_password = bcrypt_2a_to_2y(old_password)
+    
+    old_data_roles = old_user.get('data_roles', [])
+    new_data_role = map_data_role_to_integer(old_data_roles)
+    new_data_roles = [new_data_role]
+    
+    function_role = old_user.get('function_role', 1)
+    
+    new_user = {
+        'id': generate_user_id(username, index, org_id_prefix),
+        'name': display_name,
+        'password': new_password,
+        'email': username,
+        'auth_type': old_user.get('auth_type', 'Local'),
+        'display_theme': old_user.get('display_theme', 'dark-theme'),
+        'api_token': generate_api_token(username),
+        'function_role': function_role,
+        'data_role': new_data_role,
+        'data_roles': new_data_roles,
+        'remember_token': None,
+        'deleted_at': old_user.get('deleted_at'),
+        'function_roles_label': map_function_role_label(function_role),
+        'data_roles_label': map_data_role_label(new_data_role)
+    }
+    
+    return new_user
+
+
+def deduplicate_users(users_list):
+    """
+    Deduplicate users by username (email).
+    Keeps the most recently created/updated user.
+    """
+    user_map = {}
+    
+    for user in users_list:
+        username = user.get('username', '')
+        if not username:
+            continue
+        
+        updated_at = user.get('updated_at', user.get('created_at', ''))
+        
+        if username not in user_map:
+            user_map[username] = (user, updated_at)
+        else:
+            existing_user, existing_time = user_map[username]
+            if updated_at > existing_time:
+                user_map[username] = (user, updated_at)
+                logging.info(f"    Replacing older version of user: {username}")
+            else:
+                logging.debug(f"    Skipping duplicate user: {username}")
+    
+    return [user for user, _ in user_map.values()]
+
+
+def transform_users_partition(users_json, org_id_prefix=42218):
+    """
+    Transform users from IMPACT format to AIO format.
+    Returns transformed JSON string.
+    """
+    import json
+    
+    try:
+        old_users = json.loads(users_json)
+        
+        if not isinstance(old_users, list):
+            logging.warning("  Users object is not a list, wrapping it")
+            old_users = [old_users]
+        
+        logging.info(f"  Loaded {len(old_users)} users from partition")
+        
+        # Deduplicate
+        unique_users = deduplicate_users(old_users)
+        duplicates = len(old_users) - len(unique_users)
+        if duplicates > 0:
+            logging.info(f"  Removed {duplicates} duplicate user(s)")
+        
+        # Transform
+        new_users = []
+        for index, old_user in enumerate(unique_users):
+            try:
+                new_user = transform_user(old_user, index, org_id_prefix)
+                new_users.append(new_user)
+                logging.debug(f"    Transformed: {old_user.get('username', 'unknown')} → ID {new_user['id']}")
+            except Exception as e:
+                logging.error(f"    Failed to transform user {old_user.get('username', 'unknown')}: {e}")
+        
+        logging.info(f"  Successfully transformed {len(new_users)} users")
+        return json.dumps(new_users, ensure_ascii=False)
+        
+    except json.JSONDecodeError as e:
+        logging.error(f"  Failed to parse users JSON: {e}")
+        return users_json  # Return original if parsing fails
+    except Exception as e:
+        logging.error(f"  Error transforming users: {e}")
+        return users_json  # Return original if transformation fails
+
+
 def copy_objects_partition(impact_session, aio_session, partition_name, org_id, consistency_level):
     """
     Copy specific partition from objects table (users, settings, etc.).
@@ -297,6 +447,37 @@ def copy_objects_partition(impact_session, aio_session, partition_name, org_id, 
             return 0
         
         logging.info(f"  Found {len(rows_list)} rows for partition '{partition_name}'")
+        
+        # Special handling for 'users' partition - transform users to new format
+        if partition_name == 'users':
+            logging.info(f"  Applying user transformations (IMPACT → AIO format)...")
+            # Extract org_id prefix from IMPACT_ORG_ID (e.g., "calprivate" → 42218)
+            # For now, use hardcoded default. Could be made configurable.
+            org_id_prefix = 42218
+            
+            transformed_rows = []
+            for row in rows_list:
+                try:
+                    transformed_object = transform_users_partition(row.object, org_id_prefix)
+                    # Create new row with transformed data
+                    class TransformedRow:
+                        def __init__(self, partition, created_at, obj):
+                            self.partition = partition
+                            self.created_at = created_at
+                            self.object = obj
+                    
+                    transformed_rows.append(TransformedRow(
+                        row.partition,
+                        row.created_at,
+                        transformed_object
+                    ))
+                except Exception as e:
+                    logging.error(f"  Failed to transform users row: {e}")
+                    # Keep original if transformation fails
+                    transformed_rows.append(row)
+            
+            rows_list = transformed_rows
+            logging.info(f"  User transformation complete")
         
         # Delete existing data for this partition in AIO - adapt based on destination schema
         # Skip if we already truncated the table
