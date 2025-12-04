@@ -425,14 +425,14 @@ def get_partitions_from_index(session, table_name, org_id, consistency_level):
         # partition_index schema is typically: (org_id, partition, table_ref)
         # We want distinct partitions - just query it without table_name filter
         if has_org_id:
-            query = f"SELECT partition FROM {index_table} WHERE org_id = ?;"
+            query = f"SELECT partition FROM {index_table} WHERE org_id = ? ALLOW FILTERING;"
             statement = session.prepare(query)
             statement.consistency_level = consistency_level
             statement.fetch_size = 5000
             rows = execute_with_retry(session, statement, [org_id])
         else:
             # If no org_id, get all partitions
-            query = f"SELECT partition FROM {index_table};"
+            query = f"SELECT partition FROM {index_table} ALLOW FILTERING;"
             statement = session.prepare(query)
             statement.consistency_level = consistency_level
             statement.fetch_size = 5000
@@ -476,13 +476,16 @@ def scan_table_by_token_ranges(session, table_name, org_id, consistency_level, n
             logging.info(f"    Scanning token range {i+1}/{num_ranges}...")
             
             if source_has_org_id:
-                query = f"SELECT partition, created_at FROM {full_table_name} WHERE token(partition) >= {start_token} AND token(partition) < {end_token} AND org_id = ? ALLOW FILTERING;"
+                # For tables with org_id, partition key is (org_id, partition)
+                # token() must include ALL partition key components
+                query = f"SELECT partition, created_at FROM {full_table_name} WHERE token(org_id, partition) >= {start_token} AND token(org_id, partition) < {end_token} AND org_id = ? ALLOW FILTERING;"
                 statement = session.prepare(query)
                 statement.consistency_level = consistency_level
                 statement.fetch_size = 1000
                 statement.timeout = 300  # 5 minutes per range
                 rows = execute_with_retry(session, statement, [org_id])
             else:
+                # For tables without org_id, partition key is just (partition)
                 query = f"SELECT partition, created_at FROM {full_table_name} WHERE token(partition) >= {start_token} AND token(partition) < {end_token};"
                 statement = session.prepare(query)
                 statement.consistency_level = consistency_level
@@ -649,6 +652,9 @@ def copy_table_with_org_filter(impact_session, aio_session, table_name, org_id, 
     Optimized for parallel processing with batching.
     Handles both old schema (with org_id) and new schema (without org_id).
     Skips if already completed according to checkpoint.
+    
+    Schema note: All tables use PRIMARY KEY ((org_id, partition), created_at)
+    There is no dedicated index table - partition_index is a regular data table.
     """
     # Check checkpoint before copying
     if is_table_completed(checkpoint, table_name):
@@ -694,73 +700,39 @@ def copy_table_with_org_filter(impact_session, aio_session, table_name, org_id, 
             
             matching_keys = []
             
-            # Strategy 1: Try partition_index (fastest if available)
-            partitions = get_partitions_from_index(impact_session, table_name, org_id, consistency_level)
-            
-            if partitions:
-                # EFFICIENT: Query each partition individually (no ALLOW FILTERING on main table)
-                logging.info(f"Querying {len(partitions)} partitions individually...")
+            # Strategy 1: Token-range scanning (primary method for large tables)
+            # All tables use PRIMARY KEY ((org_id, partition), created_at) so we scan by token ranges
+            logging.info(f"Using token-range scan for efficient partition discovery...")
+            try:
+                matching_keys = scan_table_by_token_ranges(
+                    impact_session, table_name, org_id, consistency_level, 
+                    num_ranges=20  # Split into 20 ranges for large tables
+                )
+            except Exception as token_error:
+                logging.error(f"Token-range scan failed: {token_error}")
+                logging.info(f"Falling back to simple ALLOW FILTERING scan...")
                 
+                # Strategy 2: FALLBACK - Simple ALLOW FILTERING (less efficient but works)
                 if source_has_org_id:
-                    partition_query = f"SELECT partition, created_at FROM {full_table_name} WHERE partition = ? AND org_id = ?;"
-                    partition_statement = impact_session.prepare(partition_query)
-                    partition_statement.consistency_level = consistency_level
-                    partition_statement.fetch_size = fetch_size
-                    
-                    for partition in tqdm(partitions, desc=f"Scanning partitions in {table_name}", unit="partition"):
-                        try:
-                            rows = execute_with_retry(impact_session, partition_statement, [partition, org_id])
-                            for row in rows:
-                                matching_keys.append((row.partition, row.created_at))
-                        except Exception as e:
-                            logging.warning(f"Failed to query partition {partition}: {e}")
+                    logging.info(f"Scanning {full_table_name} for org_id {org_id} (ALLOW FILTERING)...")
+                    lightweight_query = f"SELECT partition, created_at FROM {full_table_name} WHERE org_id = ? ALLOW FILTERING;"
+                    lightweight_statement = impact_session.prepare(lightweight_query)
+                    lightweight_statement.consistency_level = consistency_level
+                    lightweight_statement.fetch_size = fetch_size
+                    lightweight_statement.timeout = 600  # 10 minute timeout for big scan
+                    lightweight_rows = execute_with_retry(impact_session, lightweight_statement, [org_id])
                 else:
-                    partition_query = f"SELECT partition, created_at FROM {full_table_name} WHERE partition = ?;"
-                    partition_statement = impact_session.prepare(partition_query)
-                    partition_statement.consistency_level = consistency_level
-                    partition_statement.fetch_size = fetch_size
-                    
-                    for partition in tqdm(partitions, desc=f"Scanning partitions in {table_name}", unit="partition"):
-                        try:
-                            rows = execute_with_retry(impact_session, partition_statement, [partition])
-                            for row in rows:
-                                matching_keys.append((row.partition, row.created_at))
-                        except Exception as e:
-                            logging.warning(f"Failed to query partition {partition}: {e}")
-            
-            else:
-                # Strategy 2: Token-range scanning (better than full table ALLOW FILTERING)
-                logging.info(f"partition_index unavailable, using token-range scan...")
-                try:
-                    matching_keys = scan_table_by_token_ranges(
-                        impact_session, table_name, org_id, consistency_level, 
-                        num_ranges=20  # Split into 20 ranges for large tables
-                    )
-                except Exception as token_error:
-                    logging.error(f"Token-range scan failed: {token_error}")
-                    logging.info(f"Falling back to simple ALLOW FILTERING scan...")
-                    
-                    # Strategy 3: FALLBACK - Simple ALLOW FILTERING (last resort)
-                    if source_has_org_id:
-                        logging.info(f"Scanning {full_table_name} for org_id {org_id} (ALLOW FILTERING)...")
-                        lightweight_query = f"SELECT partition, created_at FROM {full_table_name} WHERE org_id = ? ALLOW FILTERING;"
-                        lightweight_statement = impact_session.prepare(lightweight_query)
-                        lightweight_statement.consistency_level = consistency_level
-                        lightweight_statement.fetch_size = fetch_size
-                        lightweight_statement.timeout = 600  # 10 minute timeout for big scan
-                        lightweight_rows = execute_with_retry(impact_session, lightweight_statement, [org_id])
-                    else:
-                        logging.info(f"Scanning all rows in {full_table_name} (no org_id filtering)...")
-                        lightweight_query = f"SELECT partition, created_at FROM {full_table_name};"
-                        lightweight_statement = impact_session.prepare(lightweight_query)
-                        lightweight_statement.consistency_level = consistency_level
-                        lightweight_statement.fetch_size = fetch_size
-                        lightweight_statement.timeout = 600
-                        lightweight_rows = execute_with_retry(impact_session, lightweight_statement)
-                    
-                    # Collect all matching keys
-                    for row in tqdm(lightweight_rows, desc=f"Scanning {table_name}", unit="row"):
-                        matching_keys.append((row.partition, row.created_at))
+                    logging.info(f"Scanning all rows in {full_table_name} (no org_id filtering)...")
+                    lightweight_query = f"SELECT partition, created_at FROM {full_table_name};"
+                    lightweight_statement = impact_session.prepare(lightweight_query)
+                    lightweight_statement.consistency_level = consistency_level
+                    lightweight_statement.fetch_size = fetch_size
+                    lightweight_statement.timeout = 600
+                    lightweight_rows = execute_with_retry(impact_session, lightweight_statement)
+                
+                # Collect all matching keys
+                for row in tqdm(lightweight_rows, desc=f"Scanning {table_name}", unit="row"):
+                    matching_keys.append((row.partition, row.created_at))
             
             logging.info(f"Found {len(matching_keys)} rows total")
             

@@ -84,4 +84,57 @@ try:
 except Exception as e:
     print(f"Error querying sample data: {e}")
 
+# Check for artifact_partition_summary table (from estimator.py)
+print("\n" + "="*80)
+print("ARTIFACT_PARTITION_SUMMARY TABLE SCHEMA")
+print("="*80)
+
+query = """
+    SELECT column_name, type, kind, position
+    FROM system_schema.columns
+    WHERE keyspace_name='artifacts' AND table_name='artifact_partition_summary'
+"""
+try:
+    rows = session.execute(query)
+    columns = []
+    for row in rows:
+        columns.append({
+            'name': row.column_name,
+            'type': row.type,
+            'kind': row.kind,
+            'position': row.position
+        })
+    
+    if columns:
+        columns.sort(key=lambda x: (0 if x['kind'] == 'partition_key' else 1 if x['kind'] == 'clustering' else 2, x['position'] or 999))
+        
+        print("\nColumns:")
+        for col in columns:
+            kind_label = {
+                'partition_key': 'PARTITION KEY',
+                'clustering': 'CLUSTERING',
+                'regular': 'REGULAR'
+            }.get(col['kind'], col['kind'])
+            print(f"  {col['name']:20s} | {col['type']:20s} | {kind_label}")
+        
+        print("\n" + "="*80)
+        print("SAMPLE DATA (first 5 rows)")
+        print("="*80)
+        
+        column_names = [col['name'] for col in columns]
+        sample_query = f"SELECT {', '.join(column_names)} FROM artifacts.artifact_partition_summary LIMIT 5;"
+        print(f"\nQuery: {sample_query}\n")
+        
+        rows = session.execute(sample_query)
+        for i, row in enumerate(rows, 1):
+            print(f"Row {i}:")
+            for col_name in column_names:
+                value = getattr(row, col_name, None)
+                print(f"  {col_name}: {value}")
+            print()
+    else:
+        print("\nTable 'artifacts.artifact_partition_summary' not found or has no columns.")
+except Exception as e:
+    print(f"Error querying artifact_partition_summary: {e}")
+
 cluster.shutdown()
