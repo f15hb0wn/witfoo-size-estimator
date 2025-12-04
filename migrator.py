@@ -1,7 +1,7 @@
 import time
 from cassandra.cluster import Cluster, NoHostAvailable
 from cassandra.auth import PlainTextAuthProvider
-from cassandra import ReadTimeout, ConsistencyLevel, Unavailable, WriteTimeout
+from cassandra import ReadTimeout, ConsistencyLevel, Unavailable, WriteTimeout, ReadFailure
 from cassandra.query import BatchStatement, SimpleStatement
 from cassandra.policies import WhiteListRoundRobinPolicy
 from ssl import SSLContext, CERT_NONE, TLSVersion
@@ -120,7 +120,7 @@ impact_cluster = Cluster(
 )
 logging.info("Connecting to IMPACT Cassandra server (single node only)...")
 impact = impact_cluster.connect()
-impact.default_timeout = 600
+impact.default_timeout = 1200  # Increased to 20 minutes for large scans
 impact.default_consistency_level = ConsistencyLevel.QUORUM
 logging.info("Connection to IMPACT Cassandra server successful")
 
@@ -215,7 +215,7 @@ def get_consistency_name(consistency_level):
     return consistency_names.get(consistency_level, str(consistency_level))
 
 
-def execute_with_retry(session, statement, params=None, max_retries=2):
+def execute_with_retry(session, statement, params=None, max_retries=3):
     """Execute a statement with automatic retry on consistency failures."""
     original_consistency = statement.consistency_level
     
@@ -237,20 +237,28 @@ def execute_with_retry(session, statement, params=None, max_retries=2):
             
             return result
             
-        except (Unavailable, ReadTimeout, WriteTimeout) as e:
+        except (Unavailable, ReadTimeout, WriteTimeout, ReadFailure) as e:
             if retry < max_retries:
-                if statement.consistency_level == ConsistencyLevel.QUORUM:
+                wait_time = 2 ** retry  # Exponential backoff: 1s, 2s, 4s, 8s
+                if isinstance(e, ReadFailure):
+                    logging.warning(f"ReadFailure on replica: {e}. Waiting {wait_time}s before retry {retry + 1}/{max_retries}...")
+                    time.sleep(wait_time)
+                elif statement.consistency_level == ConsistencyLevel.QUORUM:
                     logging.warning(f"Consistency QUORUM failed: {e}. Retrying with ONE...")
                     statement.consistency_level = ConsistencyLevel.ONE
-                elif retry == max_retries - 1:
-                    logging.error(f"Final retry failed: {e}")
-                    raise
+                    time.sleep(wait_time)
+                else:
+                    logging.warning(f"Query failed: {e}. Waiting {wait_time}s before retry {retry + 1}/{max_retries}...")
+                    time.sleep(wait_time)
             else:
+                logging.error(f"Final retry failed after {max_retries} attempts: {e}")
                 raise
         except NoHostAvailable as e:
             logging.error(f"No hosts available: {e}")
             if retry < max_retries:
-                time.sleep(2 ** retry)
+                wait_time = 2 ** retry
+                logging.warning(f"Waiting {wait_time}s before retry...")
+                time.sleep(wait_time)
             else:
                 raise
     
@@ -403,6 +411,39 @@ def transform_users_partition(users_json, org_id_prefix=42218):
     except Exception as e:
         logging.error(f"  Error transforming users: {e}")
         return users_json  # Return original if transformation fails
+
+
+def get_partitions_from_index(session, table_name, org_id, consistency_level):
+    """Query partition_index to get list of valid partitions for org_id."""
+    keyspace = "precinct"
+    index_table = f"{keyspace}.partition_index"
+    
+    try:
+        # Check if partition_index has org_id column
+        has_org_id = SOURCE_SCHEMAS.get('partition_index', True)
+        
+        if has_org_id:
+            query = f"SELECT DISTINCT partition FROM {index_table} WHERE org_id = ? AND table_name = ? ALLOW FILTERING;"
+            statement = session.prepare(query)
+            statement.consistency_level = consistency_level
+            statement.fetch_size = 5000
+            rows = execute_with_retry(session, statement, [org_id, table_name])
+        else:
+            # If no org_id, get all partitions for this table
+            query = f"SELECT DISTINCT partition FROM {index_table} WHERE table_name = ? ALLOW FILTERING;"
+            statement = session.prepare(query)
+            statement.consistency_level = consistency_level
+            statement.fetch_size = 5000
+            rows = execute_with_retry(session, statement, [table_name])
+        
+        partitions = [row.partition for row in rows]
+        logging.info(f"  Found {len(partitions)} partitions in partition_index for {table_name}")
+        return partitions
+        
+    except Exception as e:
+        logging.warning(f"  Could not query partition_index for {table_name}: {e}")
+        logging.warning(f"  Falling back to full table scan...")
+        return None
 
 
 def copy_objects_partition(impact_session, aio_session, partition_name, org_id, consistency_level):
@@ -595,29 +636,64 @@ def copy_table_with_org_filter(impact_session, aio_session, table_name, org_id, 
             logging.info(f"\nAttempt {attempt + 1}/{max_retries + 1} to copy {full_table_name}...")
             consistency_level = ConsistencyLevel.ONE  # Use ONE for better performance
             
-            # 1. Scan for matching rows - adapt query based on source schema
-            if source_has_org_id:
-                logging.info(f"Scanning {full_table_name} for org_id {org_id}...")
-                lightweight_query = f"SELECT partition, created_at FROM {full_table_name} WHERE org_id = ? ALLOW FILTERING;"
-                lightweight_statement = impact_session.prepare(lightweight_query)
-                lightweight_statement.consistency_level = consistency_level
-                lightweight_statement.fetch_size = fetch_size
-                lightweight_rows = execute_with_retry(impact_session, lightweight_statement, [org_id])
-            else:
-                # If source doesn't have org_id, we need to scan all rows
-                logging.info(f"Scanning all rows in {full_table_name} (no org_id filtering)...")
-                lightweight_query = f"SELECT partition, created_at FROM {full_table_name};"
-                lightweight_statement = impact_session.prepare(lightweight_query)
-                lightweight_statement.consistency_level = consistency_level
-                lightweight_statement.fetch_size = fetch_size
-                lightweight_rows = execute_with_retry(impact_session, lightweight_statement)
+            # 1. Try to get partitions from partition_index first (efficient)
+            partitions = get_partitions_from_index(impact_session, table_name, org_id, consistency_level)
             
-            # Collect all matching keys
             matching_keys = []
-            for row in tqdm(lightweight_rows, desc=f"Scanning {table_name}", unit="row"):
-                matching_keys.append((row.partition, row.created_at))
             
-            logging.info(f"Found {len(matching_keys)} rows")
+            if partitions:
+                # EFFICIENT: Query each partition individually (no ALLOW FILTERING)
+                logging.info(f"Querying {len(partitions)} partitions individually...")
+                
+                if source_has_org_id:
+                    partition_query = f"SELECT partition, created_at FROM {full_table_name} WHERE partition = ? AND org_id = ?;"
+                    partition_statement = impact_session.prepare(partition_query)
+                    partition_statement.consistency_level = consistency_level
+                    partition_statement.fetch_size = fetch_size
+                    
+                    for partition in tqdm(partitions, desc=f"Scanning partitions in {table_name}", unit="partition"):
+                        try:
+                            rows = execute_with_retry(impact_session, partition_statement, [partition, org_id])
+                            for row in rows:
+                                matching_keys.append((row.partition, row.created_at))
+                        except Exception as e:
+                            logging.warning(f"Failed to query partition {partition}: {e}")
+                else:
+                    partition_query = f"SELECT partition, created_at FROM {full_table_name} WHERE partition = ?;"
+                    partition_statement = impact_session.prepare(partition_query)
+                    partition_statement.consistency_level = consistency_level
+                    partition_statement.fetch_size = fetch_size
+                    
+                    for partition in tqdm(partitions, desc=f"Scanning partitions in {table_name}", unit="partition"):
+                        try:
+                            rows = execute_with_retry(impact_session, partition_statement, [partition])
+                            for row in rows:
+                                matching_keys.append((row.partition, row.created_at))
+                        except Exception as e:
+                            logging.warning(f"Failed to query partition {partition}: {e}")
+            else:
+                # FALLBACK: Use ALLOW FILTERING scan (less efficient but works without index)
+                if source_has_org_id:
+                    logging.info(f"Scanning {full_table_name} for org_id {org_id} (ALLOW FILTERING)...")
+                    lightweight_query = f"SELECT partition, created_at FROM {full_table_name} WHERE org_id = ? ALLOW FILTERING;"
+                    lightweight_statement = impact_session.prepare(lightweight_query)
+                    lightweight_statement.consistency_level = consistency_level
+                    lightweight_statement.fetch_size = fetch_size
+                    lightweight_rows = execute_with_retry(impact_session, lightweight_statement, [org_id])
+                else:
+                    # If source doesn't have org_id, we need to scan all rows
+                    logging.info(f"Scanning all rows in {full_table_name} (no org_id filtering)...")
+                    lightweight_query = f"SELECT partition, created_at FROM {full_table_name};"
+                    lightweight_statement = impact_session.prepare(lightweight_query)
+                    lightweight_statement.consistency_level = consistency_level
+                    lightweight_statement.fetch_size = fetch_size
+                    lightweight_rows = execute_with_retry(impact_session, lightweight_statement)
+                
+                # Collect all matching keys
+                for row in tqdm(lightweight_rows, desc=f"Scanning {table_name}", unit="row"):
+                    matching_keys.append((row.partition, row.created_at))
+            
+            logging.info(f"Found {len(matching_keys)} rows total")
             
             if len(matching_keys) == 0:
                 logging.warning(f"No rows found in {full_table_name}")
