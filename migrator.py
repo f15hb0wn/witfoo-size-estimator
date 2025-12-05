@@ -413,43 +413,31 @@ def transform_users_partition(users_json, org_id_prefix=42218):
         return users_json  # Return original if transformation fails
 
 
-def get_partitions_from_index(session, table_name, org_id, consistency_level):
-    """Query partition_index to get list of valid partitions for org_id."""
-    keyspace = "precinct"
-    index_table = f"{keyspace}.partition_index"
+def get_hourly_partitions(session, org_id, start_date=None, end_date=None):
+    """
+    Generate list of hourly partitions based on date range.
+    Partition format: YYYY-MM-DD-HH (e.g., '2024-12-04-21')
     
-    try:
-        # Check if partition_index has org_id column
-        has_org_id = SOURCE_SCHEMAS.get('partition_index', True)
-        
-        # partition_index schema is typically: (org_id, partition, table_ref)
-        # We want distinct partitions - just query it without table_name filter
-        if has_org_id:
-            query = f"SELECT partition FROM {index_table} WHERE org_id = ? ALLOW FILTERING;"
-            statement = session.prepare(query)
-            statement.consistency_level = consistency_level
-            statement.fetch_size = 5000
-            rows = execute_with_retry(session, statement, [org_id])
-        else:
-            # If no org_id, get all partitions
-            query = f"SELECT partition FROM {index_table} ALLOW FILTERING;"
-            statement = session.prepare(query)
-            statement.consistency_level = consistency_level
-            statement.fetch_size = 5000
-            rows = execute_with_retry(session, statement)
-        
-        # Collect unique partitions
-        partitions_set = set()
-        for row in rows:
-            partitions_set.add(row.partition)
-        
-        partitions = list(partitions_set)
-        logging.info(f"  Found {len(partitions)} unique partitions in partition_index")
-        return partitions
-        
-    except Exception as e:
-        logging.warning(f"  Could not query partition_index: {e}")
-        return None
+    If no date range provided, generates last 365 days of hourly partitions.
+    """
+    from datetime import datetime, timedelta
+    
+    if end_date is None:
+        end_date = datetime.utcnow()
+    if start_date is None:
+        # Default: last 365 days
+        start_date = end_date - timedelta(days=365)
+    
+    partitions = []
+    current = start_date.replace(minute=0, second=0, microsecond=0)
+    
+    while current <= end_date:
+        partition = current.strftime('%Y-%m-%d-%H')
+        partitions.append(partition)
+        current += timedelta(hours=1)
+    
+    logging.info(f"  Generated {len(partitions)} hourly partitions from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+    return partitions
 
 
 def scan_table_by_token_ranges(session, table_name, org_id, consistency_level, num_ranges=10):
@@ -700,41 +688,50 @@ def copy_table_with_org_filter(impact_session, aio_session, table_name, org_id, 
             
             matching_keys = []
             
-            # Strategy 1: Token-range scanning (primary method for large tables)
-            # All tables use PRIMARY KEY ((org_id, partition), created_at) so we scan by token ranges
-            logging.info(f"Using token-range scan for efficient partition discovery...")
-            try:
-                matching_keys = scan_table_by_token_ranges(
-                    impact_session, table_name, org_id, consistency_level, 
-                    num_ranges=20  # Split into 20 ranges for large tables
-                )
-            except Exception as token_error:
-                logging.error(f"Token-range scan failed: {token_error}")
-                logging.info(f"Falling back to simple ALLOW FILTERING scan...")
+            # Strategy: Full table scan with client-side org_id filtering
+            # Scan all rows and discard those not matching our org_id
+            # Use fetch_size=1 to minimize memory and network issues
+            logging.info(f"Starting full table scan with client-side org_id filtering (fetch_size=1)...")
+            
+            if source_has_org_id:
+                # Scan entire table, fetch org_id along with keys
+                scan_query = f"SELECT partition, created_at, org_id FROM {full_table_name};"
+                scan_statement = impact_session.prepare(scan_query)
+                scan_statement.consistency_level = consistency_level
+                scan_statement.fetch_size = 1  # Fetch one row at a time to reduce memory/network load
+                scan_statement.timeout = None  # No timeout for full table scan
                 
-                # Strategy 2: FALLBACK - Simple ALLOW FILTERING (less efficient but works)
-                if source_has_org_id:
-                    logging.info(f"Scanning {full_table_name} for org_id {org_id} (ALLOW FILTERING)...")
-                    lightweight_query = f"SELECT partition, created_at FROM {full_table_name} WHERE org_id = ? ALLOW FILTERING;"
-                    lightweight_statement = impact_session.prepare(lightweight_query)
-                    lightweight_statement.consistency_level = consistency_level
-                    lightweight_statement.fetch_size = fetch_size
-                    lightweight_statement.timeout = 600  # 10 minute timeout for big scan
-                    lightweight_rows = execute_with_retry(impact_session, lightweight_statement, [org_id])
-                else:
-                    logging.info(f"Scanning all rows in {full_table_name} (no org_id filtering)...")
-                    lightweight_query = f"SELECT partition, created_at FROM {full_table_name};"
-                    lightweight_statement = impact_session.prepare(lightweight_query)
-                    lightweight_statement.consistency_level = consistency_level
-                    lightweight_statement.fetch_size = fetch_size
-                    lightweight_statement.timeout = 600
-                    lightweight_rows = execute_with_retry(impact_session, lightweight_statement)
+                logging.info(f"Scanning all rows in {full_table_name} (one row at a time)...")
+                rows = execute_with_retry(impact_session, scan_statement)
                 
-                # Collect all matching keys
-                for row in tqdm(lightweight_rows, desc=f"Scanning {table_name}", unit="row"):
+                scanned = 0
+                matched = 0
+                for row in tqdm(rows, desc=f"Scanning {table_name}", unit="row"):
+                    scanned += 1
+                    if row.org_id == org_id:
+                        matching_keys.append((row.partition, row.created_at))
+                        matched += 1
+                    
+                    # Log progress every 10,000 rows
+                    if scanned % 10000 == 0:
+                        logging.info(f"  Scanned {scanned:,} rows, found {matched:,} matching org_id '{org_id}'")
+                
+                logging.info(f"Full table scan complete: scanned {scanned:,} rows, found {matched:,} matching rows")
+            else:
+                # If no org_id in source, scan and take all rows
+                scan_query = f"SELECT partition, created_at FROM {full_table_name};"
+                scan_statement = impact_session.prepare(scan_query)
+                scan_statement.consistency_level = consistency_level
+                scan_statement.fetch_size = 1  # Fetch one row at a time
+                scan_statement.timeout = None
+                
+                logging.info(f"Scanning all rows in {full_table_name} (no org_id filtering, one row at a time)...")
+                rows = execute_with_retry(impact_session, scan_statement)
+                
+                for row in tqdm(rows, desc=f"Scanning {table_name}", unit="row"):
                     matching_keys.append((row.partition, row.created_at))
             
-            logging.info(f"Found {len(matching_keys)} rows total")
+            logging.info(f"Found {len(matching_keys):,} rows total for org_id '{org_id}'")
             
             if len(matching_keys) == 0:
                 logging.warning(f"No rows found in {full_table_name}")
